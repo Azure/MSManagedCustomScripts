@@ -1,4 +1,4 @@
-a# SYNOPSIS
+# SYNOPSIS
 #   Shuts down and recovers zoned node pools of an AKS cluster using Automation Account identity.
 #
 # DESCRIPTION
