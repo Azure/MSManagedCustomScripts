@@ -9,9 +9,11 @@
 #
 # PARAMETERS
 #   -ResourceId: The resource ID of the Azure Load Balancer to target.
+#   -UAMIClientId: Optional. Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.
 #
 # EXAMPLE
 #   .\Fault-LoadBalancerZones.ps1 -ResourceId "/subscriptions/xxx/.../loadBalancers/myLoadBalancer"
+#   .\Fault-LoadBalancerZones.ps1 -ResourceId "/subscriptions/xxx/.../loadBalancers/myLoadBalancer" -UAMIClientId "12345678-1234-1234-1234-123456789012"
 
 #Requires -Modules Az.Network
 [CmdletBinding()]
@@ -20,9 +22,12 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ResourceId,
 
-    [Parameter(Mandatory=$true, HelpMessage="Duration to keep health probes down (TimeSpan, e.g. '00:05:00' for 5 minutes)")]
+    [Parameter(Mandatory=$true, HelpMessage="Duration in minutes to keep health probes down (e.g. '5' for 5 minutes)")]
     [ValidateNotNullOrEmpty()]
-    [TimeSpan]$Duration
+    [long]$Duration,
+
+    [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
+    [string]$UAMIClientId
 )
 
 #region Logging Function
@@ -57,9 +62,17 @@ function ConvertFrom-ResourceIdLB {
 
 #region Authenticate and Module Init
 function Connect-ToAzure {
+    param(
+        [string]$ClientId
+    )
     try {
-        Write-Log "Authenticating to Azure via Managed Identity" "INFO"
-        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        if ([string]::IsNullOrEmpty($ClientId)) {
+            Write-Log "Authenticating to Azure via System-Assigned Managed Identity" "INFO"
+            Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        } else {
+            Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
+            Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+        }
         $ctx = Get-AzContext -ErrorAction Stop
         Write-Log "Connected as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)" "SUCCESS"
         return $true
@@ -166,7 +179,7 @@ function Override-LoadBalancerHealthProbes {
 Write-Log "===== Starting Load Balancer Health Probe Override =====" "INFO"
 Write-Log "Target LB: $ResourceId" "INFO"
 
-if (-not (Connect-ToAzure)) { throw "Authentication failed" }
+if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
 if (-not (Initialize-Modules)) { throw "Module init failed" }
 
 # Parse input
@@ -179,8 +192,11 @@ if ($info.SubscriptionId) {
     Write-Log "Switched to subscription $($info.SubscriptionId)" "INFO"
 }
 
+# Convert $Duration (minutes) to TimeSpan for use in the script
+$DurationTimeSpan = New-TimeSpan -Minutes $Duration
+
 # Perform override
-$success = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $Duration
+$success = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $DurationTimeSpan
 
 if ($success) {
     Write-Log "Override operation completed" "SUCCESS"
