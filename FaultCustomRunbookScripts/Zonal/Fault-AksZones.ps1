@@ -22,7 +22,10 @@ param(
 
     [Parameter(Mandatory=$true, HelpMessage="Duration in minutes before restoring node pools")]
     [ValidateRange(1,1440)]
-    [int]$DurationInMinutes
+    [int]$DurationInMinutes,
+
+    [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
+    [string]$UAMIClientId
 )
 
 #region Logging Function
@@ -57,9 +60,22 @@ function ConvertFrom-ResourceIdAKS {
 
 #region Authenticate and Module Init
 function Connect-ToAzure {
-    try {
-        Write-Log "Authenticating to Azure via Managed Identity" "INFO"
-        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+    param(
+        [string]$ClientId
+    )
+    try 
+    {
+        if ([string]::IsNullOrEmpty($ClientId)) 
+        {
+            Write-Log "Authenticating to Azure via System-Assigned Managed Identity" "INFO"
+            Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        } 
+        else 
+        {
+            Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
+            Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+        }
+        
         $ctx = Get-AzContext -ErrorAction Stop
         Write-Log "Connected as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)" "SUCCESS"
         return $true

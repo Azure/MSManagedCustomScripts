@@ -51,7 +51,10 @@
 param (
     [Parameter(Mandatory = $true, HelpMessage = "Resource ID of the Azure SQL Database")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId
+    [string]$ResourceId,
+
+    [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
+    [string]$UAMIClientId
 )
 
 #region Functions
@@ -191,19 +194,29 @@ function ConvertFrom-ResourceId {
 function Connect-ToAzure {
     [CmdletBinding()]
     [OutputType([bool])]
-    param()
+    param(
+        [string]$ClientId
+    )
     
-    try {
-            Write-Log "Authenticating with Azure using Runbook Identity" "SUCCESS"
-            # Connect using Managed Identity (available in Azure Automation)
-            $null = Connect-AzAccount -Identity -ErrorAction Stop
+    try 
+    {
+        if ([string]::IsNullOrEmpty($ClientId)) 
+        {
+            Write-Log "Authenticating to Azure via System-Assigned Managed Identity" "INFO"
+            Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        } 
+        else 
+        {
+            Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
+            Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+        }
             
-            Write-Log "Connect command executed" "SUCCESS"
-            # Verify connection was successful
-            $context = Get-AzContext -ErrorAction Stop
-            Write-Log "Successfully connected to Azure using Managed Identity" "SUCCESS"
-            Write-Log "Connected as: $($context.Account.Id) in subscription: $($context.Subscription.Name)" "INFO"
-            return $true
+        Write-Log "Connect command executed" "SUCCESS"
+        # Verify connection was successful
+        $context = Get-AzContext -ErrorAction Stop
+        Write-Log "Successfully connected to Azure using Managed Identity" "SUCCESS"
+        Write-Log "Connected as: $($context.Account.Id) in subscription: $($context.Subscription.Name)" "INFO"
+        return $true
     }
     catch {
         Write-Log "Failed to authenticate to Azure: $($_.Exception.Message)" "ERROR"
@@ -391,12 +404,7 @@ try {
     Write-Log "Authenticating with Azure using Runbook Identity" "INFO"
     
     # Step 2: Authenticate to Azure using Managed Identity
-    $null = Connect-AzAccount -Identity -ErrorAction Continue
-    
-    if (-not $?) {
-        Write-Log "Failed to connect to Azure using Managed Identity" "ERROR"
-        throw "Azure authentication failed. Cannot proceed with failover operation."
-    }
+    if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
     
     Write-Log "Connect command executed" "SUCCESS"
 
