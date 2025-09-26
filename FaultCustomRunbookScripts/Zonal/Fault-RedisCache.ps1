@@ -49,9 +49,9 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Resource ID of the Azure Redis Cache")]
+    [Parameter(Mandatory = $true, HelpMessage = "Comma separated resource IDs of the Azure Redis Caches")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId,
+    [string]$ResourceIds,
 
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
@@ -101,11 +101,11 @@ function Write-Log {
     
     # Write to appropriate Azure Runbook output stream based on severity level
     switch ($Level) {
-        "INFO"    { Write-Output $logEntry }
+        "INFO"    { Write-Information $logEntry -InformationAction Continue }
         "WARNING" { Write-Warning $logEntry }
         "ERROR"   { Write-Error $logEntry }
-        "SUCCESS" { Write-Output $logEntry }
-        default   { Write-Output $logEntry }
+        "SUCCESS" { Write-Information $logEntry -InformationAction Continue }
+        default   { Write-Information $logEntry -InformationAction Continue }
     }
 }
 
@@ -389,71 +389,84 @@ Write-Log "AZURE REDIS CACHE RESTART SCRIPT" "INFO"
 Write-Log "Version: 1.3 | Date: 2025-09-19" "INFO"
 Write-Log "============================================================" "INFO"
 Write-Log "Starting Redis Cache Restart operation..." "INFO"
-Write-Log "Target Resource: $ResourceId" "INFO"
+Write-Log "Raw Input: $ResourceIds" "INFO"
+$cacheIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $cacheIds -or $cacheIds.Count -eq 0) { throw "No valid Redis cache resource IDs provided" }
+Write-Log "Parsed $($cacheIds.Count) Redis cache id(s)." 'INFO'
 
-# Initialize success tracking variable
-$operationSuccess = $false
-$startTime = Get-Date
+if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
+if (-not (Initialize-RequiredModules)) { throw "Module init failed" }
 
-try {
-    # Step 1: Authenticate to Azure
-    Write-Log "Step 1: Authenticating to Azure..." "INFO"
-    if (-not (Connect-ToAzure -ClientId $UAMIClientId)) {
-        throw "Azure authentication failed"
+$scriptStart = Get-Date
+
+# Capture function definitions for parallel execution
+$functionDefs = @"
+$(Get-Content Function:\Write-Log -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\ConvertFrom-ResourceId -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Connect-ToAzure -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Initialize-RequiredModules -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Invoke-RedisCacheRestart -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+"@
+
+$results = $cacheIds | ForEach-Object -Parallel {
+    # Re-create function definitions in parallel runspace
+    Invoke-Expression $using:functionDefs
+    
+    $rid = $_
+    Write-Log "Processing Redis Cache: $rid" 'INFO'
+    $parseErr = $null
+    $info = $null
+    $start = Get-Date
+    try { $info = ConvertFrom-ResourceId -ResourceId $rid } catch { $parseErr = $_.Exception.Message }
+    if ($parseErr) {
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$parseErr; StartTime=$start; EndTime=$start; Status='FailedToStart' }
     }
-    
-    # Step 2: Parse resource ID to extract components
-    Write-Log "Step 2: Parsing resource ID..." "INFO"
-    $resourceInfo = ConvertFrom-ResourceId -ResourceId $ResourceId
-    
-    Write-Log "Extracted resource information:" "INFO"
-    Write-Log "  - Subscription ID: $($resourceInfo.SubscriptionId)" "INFO"
-    Write-Log "  - Resource Group: $($resourceInfo.ResourceGroup)" "INFO"
-    Write-Log "  - Cache Name: $($resourceInfo.CacheName)" "INFO"
-    
-    # Step 3: Initialize required PowerShell modules
-    Write-Log "Step 3: Initializing required modules..." "INFO"
-    if (-not (Initialize-RequiredModules)) {
-        throw "Failed to initialize required PowerShell modules"
+    try {
+        # Re-authenticate within parallel runspace
+        if (-not (Connect-ToAzure -ClientId $using:UAMIClientId)) { 
+            throw "Authentication failed in parallel runspace" 
+        }
+        if (-not (Initialize-RequiredModules)) { 
+            throw "Module initialization failed in parallel runspace" 
+        }
+        
+        $success = Invoke-RedisCacheRestart -ResourceGroupName $info.ResourceGroup -CacheName $info.CacheName -SubscriptionId $info.SubscriptionId
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$success; ErrorMessage= if ($success) { $null } else { 'Redis cache restart failed' }; StartTime=$start; EndTime=$end; Status= (if ($success) { 'Succeeded' } else { 'Failed' }) }
+    } catch { 
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$_.Exception.Message; StartTime=$start; EndTime=$end; Status='Failed' } 
     }
-    
-    # Step 4: Execute Redis Cache restart operation
-    Write-Log "Step 4: Executing Redis Cache restart..." "INFO"
-    $operationSuccess = Invoke-RedisCacheRestart -ResourceGroupName $resourceInfo.ResourceGroup -CacheName $resourceInfo.CacheName -SubscriptionId $resourceInfo.SubscriptionId
-    
-    if (-not $operationSuccess) {
-        throw "Redis Cache restart operation failed"
-    }
-    
-    Write-Log "Redis Cache restart operation completed successfully" "SUCCESS"
+} -ThrottleLimit ([System.Environment]::ProcessorCount)
+
+$scriptEnd = Get-Date
+$successCount = ($results | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($results | Where-Object { -not $_.IsSuccess }).Count
+$overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
+
+$resourceResults = @()
+foreach ($r in $results) {
+    $durationMs = [int]([Math]::Round((($r.EndTime) - $r.StartTime).TotalMilliseconds))
+    $err = $null
+    if (-not $r.IsSuccess) { $err = @{ ErrorCode='FailedToFaultResource'; Message=$r.ErrorMessage; Details=$r.ErrorMessage; Category=$r.Status; IsRetryable=$false } }
+    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$r.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status } }
 }
-catch {
-    Write-Log "Script execution failed: $($_.Exception.Message)" "ERROR"
-    $operationSuccess = $false
+$executionResult = [ordered]@{
+    Status=$overallStatus
+    ResourceResults=$resourceResults
+    SuccessCount=$successCount
+    FailureCount=$failureCount
+    ExecutionStartTime=$scriptStart.ToUniversalTime()
+    ExecutionEndTime=$scriptEnd.ToUniversalTime()
+    GlobalError= if ($overallStatus -eq 'Failed') { 'All Redis cache restart operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some operations failed.' } else { $null }
 }
+$executionJson = $executionResult | ConvertTo-Json -Depth 6
+Write-Output $executionJson
 
-# Step 6: Operation summary and cleanup
-$endTime = Get-Date
-$executionDuration = $endTime - $startTime
-
-Write-Log "============================================================" "INFO"
-Write-Log "OPERATION SUMMARY" "INFO"
-Write-Log "============================================================" "INFO"
-Write-Log "Resource ID: $ResourceId" "INFO"
-Write-Log "Start Time: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "End Time: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "Execution Duration: $($executionDuration.ToString('hh\:mm\:ss'))" "INFO"
-Write-Log "Operation Result: $(if ($operationSuccess) { 'SUCCESS' } else { 'FAILED' })" $(if ($operationSuccess) { "SUCCESS" } else { "ERROR" })
-
-if ($operationSuccess) {
-    Write-Log "Redis Cache restart has been initiated successfully" "SUCCESS"
-    Write-Log "The primary node has been restarted and the cache may take several minutes to become fully available" "INFO"
-} else {
-    Write-Log "Redis Cache restart operation failed" "ERROR"
-    Write-Log "Please check the error messages above for troubleshooting information" "ERROR"
-    Write-Log "Verify that the resource ID is correct and the Automation Account has proper permissions" "ERROR"
-}
-
-Write-Log "Script execution completed" "INFO"
+# Write-Log "Script execution completed" "INFO"
 
 #endregion Main Script Execution

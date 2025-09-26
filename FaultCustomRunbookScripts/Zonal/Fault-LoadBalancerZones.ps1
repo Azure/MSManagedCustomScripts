@@ -1,11 +1,13 @@
 # SYNOPSIS
-#   Performs fault injection by overriding health probes on an Azure Load Balancer using Automation Account identity.
+#   Performs fault injection by overriding health probes on one or more Azure Load Balancers using Automation Account identity.
 #
 # DESCRIPTION
 #   This runbook accepts a Load Balancer resource ID and uses Managed Identity to authenticate.
 #   It locates all health probes associated with backend pools that have VMs or VMSS instances pinned to any availability zone,
 #   and overrides their settings to simulate failure (e.g., by changing probe port to an invalid port).
 #   This helps test zone resiliency by forcing traffic away from zoned backends.
+#
+#   Version: 1.1 (PS7 Migration)
 #
 # PARAMETERS
 #   -ResourceId: The resource ID of the Azure Load Balancer to target.
@@ -16,11 +18,12 @@
 #   .\Fault-LoadBalancerZones.ps1 -ResourceId "/subscriptions/xxx/.../loadBalancers/myLoadBalancer" -UAMIClientId "12345678-1234-1234-1234-123456789012"
 
 #Requires -Modules Az.Network
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true, HelpMessage="Resource ID of the Azure Load Balancer")]
+    [Parameter(Mandatory=$true, HelpMessage="Comma separated resource IDs of the Azure Load Balancers")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId,
+    [string]$ResourceIds,
 
     [Parameter(Mandatory=$true, HelpMessage="Duration in minutes to keep health probes down (e.g. '5' for 5 minutes)")]
     [ValidateNotNullOrEmpty()]
@@ -40,10 +43,10 @@ function Write-Log {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$ts] [$Level] $Message"
     switch ($Level) {
-        "INFO"    { Write-Output $entry }
+        "INFO"    { Write-Information $entry -InformationAction Continue }
         "WARNING" { Write-Warning $entry }
         "ERROR"   { Write-Error $entry }
-        "SUCCESS" { Write-Output $entry }
+        "SUCCESS" { Write-Information $entry -InformationAction Continue }
     }
 }
 #endregion
@@ -177,32 +180,85 @@ function Override-LoadBalancerHealthProbes {
 
 #region Main
 Write-Log "===== Starting Load Balancer Health Probe Override =====" "INFO"
-Write-Log "Target LB: $ResourceId" "INFO"
+Write-Log "Raw Input: $ResourceIds" "INFO"
+$lbIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $lbIds -or $lbIds.Count -eq 0) { throw "No valid load balancer resource IDs provided" }
+Write-Log "Parsed $($lbIds.Count) load balancer id(s)." 'INFO'
 
 if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
 if (-not (Initialize-Modules)) { throw "Module init failed" }
 
-# Parse input
-$info = ConvertFrom-ResourceIdLB -ResourceId $ResourceId
-Write-Log "Parsed: Subscription=$($info.SubscriptionId), RG=$($info.ResourceGroup), LB=$($info.LBName)" "INFO"
-
-# Switch subscription context
-if ($info.SubscriptionId) {
-    Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-    Write-Log "Switched to subscription $($info.SubscriptionId)" "INFO"
-}
-
-# Convert $Duration (minutes) to TimeSpan for use in the script
+$scriptStart = Get-Date
+$results = @()
 $DurationTimeSpan = New-TimeSpan -Minutes $Duration
 
-# Perform override
-$success = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $DurationTimeSpan
+# Capture function definitions for parallel execution
+$functionDefs = @"
+$(Get-Content Function:\Write-Log -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
 
-if ($success) {
-    Write-Log "Override operation completed" "SUCCESS"
-} else {
-    Write-Log "Override operation did not make changes or failed" "ERROR"
-    throw "Health probe override failed or no probes to override"
+$(Get-Content Function:\ConvertFrom-ResourceIdLB -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Connect-ToAzure -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Initialize-Modules -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Override-LoadBalancerHealthProbes -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+"@
+
+$results = $lbIds | ForEach-Object -Parallel {
+    # Re-create function definitions in parallel runspace
+    Invoke-Expression $using:functionDefs
+    
+    $rid = $_
+    Write-Log "Processing LB: $rid" 'INFO'
+    $parseErr = $null
+    $info = $null
+    $start = Get-Date
+    try { $info = ConvertFrom-ResourceIdLB -ResourceId $rid } catch { $parseErr = $_.Exception.Message }
+    if ($parseErr) {
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$parseErr; StartTime=$start; EndTime=$start; Status='FailedToStart' }
+    }
+    try {
+        # Re-authenticate within parallel runspace
+        if (-not (Connect-ToAzure -ClientId $using:UAMIClientId)) { 
+            throw "Authentication failed in parallel runspace" 
+        }
+        if (-not (Initialize-Modules)) { 
+            throw "Module initialization failed in parallel runspace" 
+        }
+        
+        if ($info.SubscriptionId) { Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null }
+        $success = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $using:DurationTimeSpan
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$success; ErrorMessage= if ($success) { $null } else { 'Override failed or no probes to override' }; StartTime=$start; EndTime=$end; Status= (if ($success) { 'Succeeded' } else { 'Failed' }) }
+    } catch { 
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$_.Exception.Message; StartTime=$start; EndTime=$end; Status='Failed' } 
+    }
+} -ThrottleLimit ([System.Environment]::ProcessorCount)
+$scriptEnd = Get-Date
+$successCount = ($results | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($results | Where-Object { -not $_.IsSuccess }).Count
+$overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
+
+$resourceResults = @()
+foreach ($r in $results) {
+    $durationMs = [int]([Math]::Round((($r.EndTime) - $r.StartTime).TotalMilliseconds))
+    $err = $null
+    if (-not $r.IsSuccess) { $err = @{ ErrorCode='FailedToFaultResource'; Message=$r.ErrorMessage; Details=$r.ErrorMessage; Category=$r.Status; IsRetryable=$false } }
+    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$r.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status; DurationMinutes=$Duration } }
 }
-Write-Log "===== Script execution finished =====" "INFO"
+$executionResult = [ordered]@{
+    Status=$overallStatus
+    ResourceResults=$resourceResults
+    SuccessCount=$successCount
+    FailureCount=$failureCount
+    ExecutionStartTime=$scriptStart.ToUniversalTime()
+    ExecutionEndTime=$scriptEnd.ToUniversalTime()
+    GlobalError= if ($overallStatus -eq 'Failed') { 'All load balancer probe override operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some operations failed.' } else { $null }
+}
+$executionJson = $executionResult | ConvertTo-Json -Depth 6
+Write-Output $executionJson
+# Write-Log "Overall Status: $overallStatus (Success=$successCount Failure=$failureCount)" 'INFO'
+# Write-Log "===== Script execution finished =====" "INFO"
 #endregion

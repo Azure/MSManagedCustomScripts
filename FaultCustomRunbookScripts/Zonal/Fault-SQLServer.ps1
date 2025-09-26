@@ -49,9 +49,9 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Resource ID of the Azure SQL Database")]
+    [Parameter(Mandatory = $true, HelpMessage = "Comma separated resource IDs of the Azure SQL Databases")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId,
+    [string]$ResourceIds,
 
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
@@ -102,7 +102,7 @@ function Write-Log {
     # Write to appropriate Azure Runbook output stream based on severity level
     switch ($Level) {
         "INFO" { 
-            Write-Output $logEntry 
+            Write-Information $logEntry -InformationAction Continue
         }
         "WARNING" { 
             Write-Warning $logEntry 
@@ -111,7 +111,7 @@ function Write-Log {
             Write-Error $logEntry 
         }
         "SUCCESS" { 
-            Write-Output $logEntry 
+            Write-Information $logEntry -InformationAction Continue
         }
     }
 }
@@ -391,101 +391,85 @@ Write-Log "AZURE SQL DATABASE FAILOVER SCRIPT" "INFO"
 Write-Log "Version: 1.3 | Date: 2025-05-26" "INFO"
 Write-Log "============================================================" "INFO"
 Write-Log "Starting SQL Database Failover operation..." "INFO"
-Write-Log "Target Resource: $ResourceId" "INFO"
+Write-Log "Raw Input: $ResourceIds" "INFO"
+$sqlIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $sqlIds -or $sqlIds.Count -eq 0) { throw "No valid SQL database resource IDs provided" }
+Write-Log "Parsed $($sqlIds.Count) SQL database id(s)." 'INFO'
 
-# Initialize success tracking variable
-$operationSuccess = $false
-$startTime = Get-Date
+if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
+if (-not (Initialize-RequiredModules)) { throw "Module init failed" }
 
-try {
-    # Step 1: Authenticate to Azure
-    Write-Log "Step 1: Authenticating to Azure..." "INFO"
+$scriptStart = Get-Date
 
-    Write-Log "Authenticating with Azure using Runbook Identity" "INFO"
+# Capture function definitions for parallel execution
+$functionDefs = @"
+$(Get-Content Function:\Write-Log -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\ConvertFrom-ResourceId -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Connect-ToAzure -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Initialize-RequiredModules -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+
+$(Get-Content Function:\Invoke-SQLDatabaseFailover -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+"@
+
+$results = $sqlIds | ForEach-Object -Parallel {
+    # Re-create function definitions in parallel runspace
+    Invoke-Expression $using:functionDefs
     
-    # Step 2: Authenticate to Azure using Managed Identity
-    if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
-    
-    Write-Log "Connect command executed" "SUCCESS"
-
-    # Step 3: Parse and validate resource ID
-    Write-Log "Step 3: Parsing SQL Database resource ID..." "INFO"
-    $resourceInfo = ConvertFrom-ResourceId -ResourceId $ResourceId
-    
-    Write-Log "Extracted resource information:" "INFO"
-    Write-Log "  - Subscription ID: $($resourceInfo.SubscriptionId)" "INFO"
-    Write-Log "  - Resource Group: $($resourceInfo.ResourceGroup)" "INFO"
-    Write-Log "  - Server Name: $($resourceInfo.ServerName)" "INFO"
-    Write-Log "  - Database Name: $($resourceInfo.DatabaseName)" "INFO"
-
-    # Switch subscription context
-    if ($resourceInfo.SubscriptionId) 
-    {
-        Set-AzContext -SubscriptionId $resourceInfo.SubscriptionId -ErrorAction Stop | Out-Null
-        Write-Log "Switched to subscription $($resourceInfo.SubscriptionId)" "INFO"
+    $rid = $_
+    Write-Log "Processing SQL Database: $rid" 'INFO'
+    $parseErr = $null
+    $info = $null
+    $start = Get-Date
+    try { $info = ConvertFrom-ResourceId -ResourceId $rid } catch { $parseErr = $_.Exception.Message }
+    if ($parseErr) {
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$parseErr; StartTime=$start; EndTime=$start; Status='FailedToStart' }
     }
+    try {
+        # Re-authenticate within parallel runspace
+        if (-not (Connect-ToAzure -ClientId $using:UAMIClientId)) { 
+            throw "Authentication failed in parallel runspace" 
+        }
+        if (-not (Initialize-RequiredModules)) { 
+            throw "Module initialization failed in parallel runspace" 
+        }
+        
+        if ($info.SubscriptionId) { Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null }
+        $success = Invoke-SQLDatabaseFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -DatabaseName $info.DatabaseName -SubscriptionId $info.SubscriptionId
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$success; ErrorMessage= if ($success) { $null } else { 'SQL database failover failed' }; StartTime=$start; EndTime=$end; Status= (if ($success) { 'Succeeded' } else { 'Failed' }) }
+    } catch { 
+        $end = Get-Date
+        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$_.Exception.Message; StartTime=$start; EndTime=$end; Status='Failed' } 
+    }
+} -ThrottleLimit ([System.Environment]::ProcessorCount)
 
-    # Verify connection was successful
-    $context = Get-AzContext -ErrorAction Stop
-    Write-Log "Successfully connected to Azure using Managed Identity" "SUCCESS"
-    Write-Log "Connected as: $($context.Account.Id) in subscription: $($context.Subscription.Name)" "INFO"
+$scriptEnd = Get-Date
+$successCount = ($results | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($results | Where-Object { -not $_.IsSuccess }).Count
+$overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
 
-    if (-not ($context)) {
-        throw "Azure authentication failed. Cannot proceed with failover operation."
-    }
-    
-    # Step 4: Initialize required modules
-    Write-Log "Step 2: Validating required PowerShell modules..." "INFO"
-    if (-not (Initialize-RequiredModules)) {
-        throw "Required modules are not available. Cannot proceed with failover operation."
-    }
-
-    # Step 5: Execute failover operation
-    Write-Log "Step 4: Executing SQL Database failover..." "INFO"
-    $operationSuccess = Invoke-SQLDatabaseFailover `
-        -ResourceGroupName $resourceInfo.ResourceGroup `
-        -ServerName $resourceInfo.ServerName `
-        -DatabaseName $resourceInfo.DatabaseName `
-        -SubscriptionId $resourceInfo.SubscriptionId
-    
-    if ($operationSuccess) {
-        Write-Log "SQL Database failover completed successfully" "SUCCESS"
-    }
-    else {
-        throw "SQL Database failover operation failed"
-    }
+$resourceResults = @()
+foreach ($r in $results) {
+    $durationMs = [int]([Math]::Round((($r.EndTime) - $r.StartTime).TotalMilliseconds))
+    $err = $null
+    if (-not $r.IsSuccess) { $err = @{ ErrorCode='FailedToFaultResource'; Message=$r.ErrorMessage; Details=$r.ErrorMessage; Category=$r.Status; IsRetryable=$false } }
+    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$r.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status } }
 }
-catch {
-    Write-Log "Critical error during script execution: $($_.Exception.Message)" "ERROR"
-    Write-Log "Full error details: $($_ | Out-String)" "ERROR"
-    $operationSuccess = $false
+$executionResult = [ordered]@{
+    Status=$overallStatus
+    ResourceResults=$resourceResults
+    SuccessCount=$successCount
+    FailureCount=$failureCount
+    ExecutionStartTime=$scriptStart.ToUniversalTime()
+    ExecutionEndTime=$scriptEnd.ToUniversalTime()
+    GlobalError= if ($overallStatus -eq 'Failed') { 'All SQL database failover operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some operations failed.' } else { $null }
 }
+$executionJson = $executionResult | ConvertTo-Json -Depth 6
+Write-Output $executionJson
 
-# Step 6: Operation summary and cleanup
-$endTime = Get-Date
-$executionDuration = $endTime - $startTime
-
-Write-Log "============================================================" "INFO"
-Write-Log "OPERATION SUMMARY" "INFO"
-Write-Log "============================================================" "INFO"
-Write-Log "Resource ID: $ResourceId" "INFO"
-Write-Log "Start Time: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "End Time: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "Execution Duration: $($executionDuration.ToString('hh\:mm\:ss'))" "INFO"
-Write-Log "Operation Result: $(if ($operationSuccess) { 'SUCCESS' } else { 'FAILED' })" $(if ($operationSuccess) { "SUCCESS" } else { "ERROR" })
-
-if ($operationSuccess) {
-    Write-Log "SQL Database failover operation completed successfully" "SUCCESS"
-    Write-Log "The database should now be available after the failover process" "INFO"
-}
-else {
-    Write-Log "SQL Database failover operation failed" "ERROR"
-    Write-Log "Please check the error logs above for detailed failure information" "ERROR"
-    
-    # Throw an exception to ensure the Azure Runbook reports failure
-    throw "Failover operation failed for SQL Database: $ResourceId"
-}
-
-Write-Log "Script execution completed" "INFO"
+# Write-Log "Script execution completed" "INFO"
 
 #endregion Main Script Execution

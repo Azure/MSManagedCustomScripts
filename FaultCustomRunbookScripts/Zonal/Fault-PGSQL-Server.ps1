@@ -1,39 +1,39 @@
 <#
 .SYNOPSIS
-    Performs unplanned restart with failover for an Azure PostgreSQL Flexible Server in an Azure Runbook.
+    Performs unplanned restart with failover for Azure PostgreSQL Flexible Servers in an Azure Runbook.
 
 .DESCRIPTION
-    This Azure Runbook script triggers an unplanned restart with failover for an Azure PostgreSQL Flexible Server.
-    It accepts a resource ID as input and performs forced failover operation on the server.
+    This Azure Runbook script triggers an unplanned restart with failover for one or more Azure PostgreSQL Flexible Servers.
+    It accepts a comma-separated list of resource IDs as input and performs forced failover operations on each server.
     The script includes detailed logging and error handling optimized for Azure Automation.
     
     This script is designed to simulate planned/unplanned outages for resilience testing purposes.
     It performs the following operations:
     1. Authenticates to Azure using Managed Identity
     2. Validates and imports required PowerShell modules
-    3. Parses the provided PostgreSQL server resource ID
-    4. Executes a forced failover restart on the target server
+    3. Parses the provided PostgreSQL server resource IDs
+    4. Executes a forced failover restart on each target server
     5. Provides comprehensive logging throughout the process
 
-.PARAMETER ResourceId
-    The resource ID for the Azure PostgreSQL Flexible Server to be restarted with failover.
-    The resource ID should be in the format:
+.PARAMETER ResourceIds
+    A comma-separated list of resource IDs for the Azure PostgreSQL Flexible Servers to be restarted with failover.
+    Each resource ID should be in the format:
     "/subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{server-name}"
 
 .EXAMPLE
-    # Example 1: Direct execution with resource ID
-    .\Fault-PGSQL-Server.ps1 -ResourceId "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/myRG/providers/Microsoft.DBforPostgreSQL/flexibleServers/myserver1"
+    # Example 1: Direct execution with resource IDs
+    .\Fault-PGSQL-Server.ps1 -ResourceIds "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/myRG/providers/Microsoft.DBforPostgreSQL/flexibleServers/myserver1,/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/myRG/providers/Microsoft.DBforPostgreSQL/flexibleServers/myserver2"
     
 .NOTES
     Author: Azure DevOps Team
-    Date: 2025-05-26
-    Version: 1.3
+    Date: 2025-09-25
+    Version: 2.2 (PS7 Always-Parallel)
     
     Prerequisites:
     - Az.PostgreSQL module must be imported in the Azure Automation account
     - Runbook must run with appropriate permissions (Contributor role on target PostgreSQL servers)
     - Managed Identity or Run As Account must be configured for the Automation Account
-    - Target PostgreSQL server must be a Flexible Server (not Single Server)
+    - Target PostgreSQL servers must be Flexible Servers (not Single Servers)
     
     Security Considerations:
     - This script performs destructive operations and should only be used in controlled environments
@@ -46,15 +46,20 @@
 #>
 
 #Requires -Modules Az.PostgreSQL
+#Requires -Version 7.0
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Resource ID of the Azure PostgreSQL Flexible Server")]
+    [Parameter(Mandatory = $true, HelpMessage = "Comma separated Resource IDs of the Azure PostgreSQL Flexible Servers")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId,
+    [string]$ResourceIds,
 
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
-    [string]$UAMIClientId
+    [string]$UAMIClientId,
+
+    [Parameter(Mandatory=$false, HelpMessage="Maximum number of concurrent failover operations")]
+    [ValidateRange(1,50)]
+    [int]$ThrottleLimit = 5
 )
 
 #region Functions
@@ -102,7 +107,7 @@ function Write-Log {
     # Write to appropriate Azure Runbook output stream based on severity level
     switch ($Level) {
         "INFO" { 
-            Write-Output $logEntry 
+            Write-Debug $logEntry 
         }
         "WARNING" { 
             Write-Warning $logEntry 
@@ -111,7 +116,7 @@ function Write-Log {
             Write-Error $logEntry 
         }
         "SUCCESS" { 
-            Write-Output $logEntry 
+            Write-Debug $logEntry 
         }
     }
 }
@@ -366,10 +371,10 @@ function Restart-PostgreSQLServerWithFailover {
     
     1. Initialize script execution with logging
     2. Authenticate to Azure using Managed Identity
-    3. Parse the provided resource ID to extract server details
+    3. Parse the provided resource IDs to extract server details
     4. Validate and import required PowerShell modules
-    5. Execute the failover restart operation
-    6. Provide operation summary and results
+    5. Execute the failover restart operation for each server
+    6. Provide aggregated operation results in JSON format
     
     All operations include comprehensive error handling and logging for Azure
     Automation monitoring and troubleshooting purposes.
@@ -378,102 +383,76 @@ function Restart-PostgreSQLServerWithFailover {
 # Script execution banner and initial setup
 Write-Log "============================================================" "INFO"
 Write-Log "AZURE POSTGRESQL FLEXIBLE SERVER FAILOVER SCRIPT" "INFO"
-Write-Log "Version: 1.3 | Date: 2025-05-26" "INFO"
+Write-Log "Version: 2.2 (PS7 Always-Parallel) | Date: 2025-09-25" "INFO"
 Write-Log "============================================================" "INFO"
 Write-Log "Starting PostgreSQL Flexible Server Failover operation..." "INFO"
-Write-Log "Target Resource: $ResourceId" "INFO"
+Write-Log "Raw Input: $ResourceIds" "INFO"
 
-# Initialize success tracking variable
-$operationSuccess = $false
-$startTime = Get-Date
+$pgIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $pgIds -or $pgIds.Count -eq 0) { throw "No valid PostgreSQL resource IDs provided" }
+Write-Log "Parsed $($pgIds.Count) PostgreSQL server id(s)." 'INFO'
+
+$scriptStart = Get-Date
+$opResults = @()
 
 try {
-    # Step 1: Authenticate to Azure
-    Write-Log "Step 1: Authenticating to Azure..." "INFO"
-
-    Write-Log "Authenticating with Azure using Runbook Identity" "INFO"
-    
-    # Step 2: Authenticate to Azure using Managed Identity
+    Write-Log "Authenticating to Azure..." 'INFO'
     if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
-    
-    Write-Log "Connect command executed" "SUCCESS"
+    if (-not (Initialize-RequiredModules)) { throw "Required modules not available" }
 
-    # Step 3: Parse and validate resource ID
-    Write-Log "Step 3: Parsing PostgreSQL server resource ID..." "INFO"
-    $resourceInfo = ConvertFrom-ResourceId -ResourceId $ResourceId
-    
-    Write-Log "Extracted resource information:" "INFO"
-    Write-Log "  - Subscription ID: $($resourceInfo.SubscriptionId)" "INFO"
-    Write-Log "  - Resource Group: $($resourceInfo.ResourceGroup)" "INFO"
-    Write-Log "  - Server Name: $($resourceInfo.ServerName)" "INFO"
+    Write-Log "Executing always-parallel mode. ThrottleLimit=$ThrottleLimit" 'INFO'
+    # Capture needed functions/variables for parallel scriptblocks
+    $functionDefs = @(
+        (Get-Command Write-Log).ScriptBlock.ToString(),
+        (Get-Command ConvertFrom-ResourceId).ScriptBlock.ToString(),
+        (Get-Command Restart-PostgreSQLServerWithFailover).ScriptBlock.ToString(),
+        (Get-Command Connect-ToAzure).ScriptBlock.ToString(),
+        (Get-Command Initialize-RequiredModules).ScriptBlock.ToString()
+    ) -join "`n`n"
 
-    # Switch subscription context
-    if ($resourceInfo.SubscriptionId) 
-    {
-        Set-AzContext -SubscriptionId $resourceInfo.SubscriptionId -ErrorAction Stop | Out-Null
-        Write-Log "Switched to subscription $($resourceInfo.SubscriptionId)" "INFO"
-    }
-
-    # Verify connection was successful
-    $context = Get-AzContext -ErrorAction Stop
-    Write-Log "Successfully connected to Azure using Managed Identity" "SUCCESS"
-    Write-Log "Connected as: $($context.Account.Id) in subscription: $($context.Subscription.Name)" "INFO"
-
-    if (-not ($context)) {
-        throw "Azure authentication failed. Cannot proceed with failover operation."
-    }
-    
-    # Step 4: Initialize required modules
-    Write-Log "Step 2: Validating required PowerShell modules..." "INFO"
-    if (-not (Initialize-RequiredModules)) {
-        throw "Required modules are not available. Cannot proceed with failover operation."
-    }
-
-    # Step 5: Execute failover restart operation
-    Write-Log "Step 4: Executing PostgreSQL server failover restart..." "INFO"
-    $operationSuccess = Restart-PostgreSQLServerWithFailover `
-        -ResourceGroupName $resourceInfo.ResourceGroup `
-        -ServerName $resourceInfo.ServerName `
-        -SubscriptionId $resourceInfo.SubscriptionId
-    
-    if ($operationSuccess) {
-        Write-Log "PostgreSQL server failover completed successfully" "SUCCESS"
-    }
-    else {
-        throw "PostgreSQL server failover operation failed"
-    }
+    $opResults = $pgIds | ForEach-Object -Parallel {
+        param($rid, $uami, $funcs)
+        Invoke-Expression $funcs
+        $start = Get-Date
+        $result = [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$null; StartTime=$start; EndTime=$start; Status='FailedToStart' }
+        try {
+            if (-not (Connect-ToAzure -ClientId $uami)) { throw "Auth failed in parallel runspace" }
+            if (-not (Initialize-RequiredModules)) { throw "Module init failed in parallel runspace" }
+            $info = ConvertFrom-ResourceId -ResourceId $rid
+            if ($info.SubscriptionId) { Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null }
+            $ok = Restart-PostgreSQLServerWithFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -SubscriptionId $info.SubscriptionId
+            $end = Get-Date
+            $result.IsSuccess = $ok
+            $result.ErrorMessage = if ($ok) { $null } else { 'Failover restart failed' }
+            $result.EndTime = $end
+            $result.Status = if ($ok) { 'Succeeded' } else { 'Failed' }
+        }
+        catch {
+            $result.EndTime = Get-Date
+            $result.ErrorMessage = $_.Exception.Message
+            $result.Status = 'Failed'
+        }
+        return $result
+    } -ThrottleLimit $ThrottleLimit -ArgumentList $UAMIClientId, $functionDefs
 }
-catch {
-    Write-Log "Critical error during script execution: $($_.Exception.Message)" "ERROR"
-    Write-Log "Full error details: $($_ | Out-String)" "ERROR"
-    $operationSuccess = $false
+catch { Write-Log "Critical top-level error: $($_.Exception.Message)" 'ERROR' }
+
+$scriptEnd = Get-Date
+$successCount = ($opResults | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($opResults | Where-Object { -not $_.IsSuccess }).Count
+$overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
+
+$resourceResults = @()
+foreach ($r in $opResults) {
+    $durationMs = [int]([Math]::Round((($r.EndTime) - $r.StartTime).TotalMilliseconds))
+    $err = $null
+    if (-not $r.IsSuccess) { $err = @{ ErrorCode='FailedToFaultResource'; Message=$r.ErrorMessage; Details=$r.ErrorMessage; Category=$r.Status; IsRetryable=$false } }
+    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$r.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status } }
 }
-
-# Step 6: Operation summary and cleanup
-$endTime = Get-Date
-$executionDuration = $endTime - $startTime
-
-Write-Log "============================================================" "INFO"
-Write-Log "OPERATION SUMMARY" "INFO"
-Write-Log "============================================================" "INFO"
-Write-Log "Resource ID: $ResourceId" "INFO"
-Write-Log "Start Time: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "End Time: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" "INFO"
-Write-Log "Execution Duration: $($executionDuration.ToString('hh\:mm\:ss'))" "INFO"
-Write-Log "Operation Result: $(if ($operationSuccess) { 'SUCCESS' } else { 'FAILED' })" $(if ($operationSuccess) { "SUCCESS" } else { "ERROR" })
-
-if ($operationSuccess) {
-    Write-Log "PostgreSQL Flexible Server failover operation completed successfully" "SUCCESS"
-    Write-Log "The server should now be available after the failover process" "INFO"
-}
-else {
-    Write-Log "PostgreSQL Flexible Server failover operation failed" "ERROR"
-    Write-Log "Please check the error logs above for detailed failure information" "ERROR"
-    
-    # Throw an exception to ensure the Azure Runbook reports failure
-    throw "Failover operation failed for PostgreSQL server: $ResourceId"
-}
-
-Write-Log "Script execution completed" "INFO"
+$executionResult = [ordered]@{ Status=$overallStatus; ResourceResults=$resourceResults; SuccessCount=$successCount; FailureCount=$failureCount; ExecutionStartTime=$scriptStart.ToUniversalTime(); ExecutionEndTime=$scriptEnd.ToUniversalTime(); GlobalError= if ($overallStatus -eq 'Failed') { 'All PostgreSQL failover operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some failover operations failed.' } else { $null } }
+$executionJson = $executionResult | ConvertTo-Json -Depth 6
+Write-Output $executionJson
+# Write-Log "Overall Status: $overallStatus (Success=$successCount Failure=$failureCount)" 'INFO'
+# Write-Log "Script execution completed" 'INFO'
 
 #endregion Main Script Execution
