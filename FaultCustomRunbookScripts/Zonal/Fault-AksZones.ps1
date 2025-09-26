@@ -2,23 +2,27 @@
 #   Shuts down and recovers zoned node pools of an AKS cluster using Automation Account identity.
 #
 # DESCRIPTION
-#   This runbook accepts an AKS cluster resource ID and a duration in minutes.
+#   This runbook accepts one or more AKS cluster resource IDs (comma separated) and a duration in minutes.
 #   It authenticates via Managed Identity, identifies node pools pinned to any availability zone,
 #   scales them to zero to simulate failure, waits for the specified duration, and then restores original counts.
+#   Outputs a JSON object matching RunbookExecutionResult contract for aggregated results.
+#
+#   Version: 1.1 (PS7 Migration)
 #
 # PARAMETERS
-#   -ResourceId: The resource ID of the Azure Kubernetes Service cluster to target.
+#   -ResourceIds: Comma separated list of AKS cluster resource IDs.
 #   -DurationInMinutes: Time in minutes to wait before restoring node pool counts.
 #
 # EXAMPLE
 #   .\Fault-AksZones.ps1 -ResourceId "/subscriptions/.../resourceGroups/myRG/providers/Microsoft.ContainerService/managedClusters/myAKS" -DurationInMinutes 15
 
 #Requires -Modules Az.Aks
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true, HelpMessage="Resource ID of the AKS cluster")]
+    [Parameter(Mandatory=$true, HelpMessage="Comma separated AKS cluster resource IDs")]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceId,
+    [string]$ResourceIds,
 
     [Parameter(Mandatory=$true, HelpMessage="Duration in minutes before restoring node pools")]
     [ValidateRange(1,1440)]
@@ -38,10 +42,10 @@ function Write-Log {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$ts] [$Level] $Message"
     switch ($Level) {
-        "INFO"    { Write-Output $entry }
+        "INFO"    { Write-Information $entry -InformationAction Continue }
         "WARNING" { Write-Warning $entry }
         "ERROR"   { Write-Error $entry }
-        "SUCCESS" { Write-Output $entry }
+        "SUCCESS" { Write-Information $entry -InformationAction Continue }
     }
 }
 #endregion
@@ -170,29 +174,108 @@ function Invoke-AksZoneFault {
 
 #region Main
 Write-Log "===== Starting AKS Zone Fault Injection =====" "INFO"
-Write-Log "Target AKS: $ResourceId" "INFO"
+Write-Log "Target AKS Raw Input: $ResourceIds" "INFO"
 
-if (-not (Connect-ToAzure)) { throw "Authentication failed" }
+$AksResourceList = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $AksResourceList -or $AksResourceList.Count -eq 0) { throw "No valid AKS resource IDs provided" }
+Write-Log "Parsed $($AksResourceList.Count) AKS resource id(s)." 'INFO'
+
+$scriptStart = Get-Date
+$operationObjects = @()
+
+if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
 if (-not (Initialize-Modules)) { throw "Module init failed" }
 
-# Parse input
-$info = ConvertFrom-ResourceIdAKS -ResourceId $ResourceId
-Write-Log "Parsed: Subscription=$($info.SubscriptionId), RG=$($info.ResourceGroup), Cluster=$($info.ClusterName)" "INFO"
+# Capture function definitions for parallel execution
+$functionDefs = @(
+    (Get-Command Write-Log).ScriptBlock.ToString(),
+    (Get-Command ConvertFrom-ResourceIdAKS).ScriptBlock.ToString(),
+    (Get-Command Connect-ToAzure).ScriptBlock.ToString(),
+    (Get-Command Initialize-Modules).ScriptBlock.ToString(),
+    (Get-Command Invoke-AksZoneFault).ScriptBlock.ToString()
+) -join "`n`n"
 
-# Switch subscription context
-if ($info.SubscriptionId) {
-    Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-    Write-Log "Switched to subscription $($info.SubscriptionId)" "INFO"
+Write-Log "Starting parallel processing of $($AksResourceList.Count) AKS clusters" "INFO"
+
+$operationObjects = $AksResourceList | ForEach-Object -Parallel {
+    param($rid, $durationMinutes, $uamiClientId, $funcs)
+    
+    # Re-create functions in parallel runspace
+    Invoke-Expression $funcs
+    
+    $start = Get-Date
+    $result = [pscustomobject]@{ 
+        ResourceId = $rid
+        IsSuccess = $false
+        ErrorMessage = $null
+        StartTime = $start
+        EndTime = $start
+        Status = 'FailedToStart'
+    }
+    
+    try {
+        # Parse resource ID
+        $info = ConvertFrom-ResourceIdAKS -ResourceId $rid
+        
+        # Authenticate in parallel runspace
+        if (-not (Connect-ToAzure -ClientId $uamiClientId)) {
+            throw "Authentication failed in parallel runspace"
+        }
+        
+        # Initialize modules in parallel runspace
+        if (-not (Initialize-Modules)) {
+            throw "Module initialization failed in parallel runspace"
+        }
+        
+        # Switch subscription context if needed
+        if ($info.SubscriptionId) { 
+            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null 
+        }
+        
+        # Execute the fault operation
+        $success = Invoke-AksZoneFault -ResourceGroup $info.ResourceGroup -ClusterName $info.ClusterName -DurationInMinutes $durationMinutes
+        $end = Get-Date
+        
+        $result.IsSuccess = $success
+        $result.ErrorMessage = if ($success) { $null } else { 'Operation failed or no zoned pools' }
+        $result.EndTime = $end
+        $result.Status = if ($success) { 'Succeeded' } else { 'Failed' }
+        
+    } catch {
+        $result.EndTime = Get-Date
+        $result.ErrorMessage = $_.Exception.Message
+        $result.Status = 'Failed'
+    }
+    
+    return $result
+} -ArgumentList $DurationInMinutes, $UAMIClientId, $functionDefs
+
+$scriptEnd = Get-Date
+$successCount = ($operationObjects | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($operationObjects | Where-Object { -not $_.IsSuccess }).Count
+$overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
+
+$resourceResults = @()
+foreach ($op in $operationObjects) {
+    $durationMs = [int]([Math]::Round((($op.EndTime) - $op.StartTime).TotalMilliseconds))
+    $err = $null
+    if (-not $op.IsSuccess) {
+        $err = @{ ErrorCode='FailedToFaultResource'; Message=$op.ErrorMessage; Details=$op.ErrorMessage; Category=$op.Status; IsRetryable=$false }
+    }
+    $resourceResults += @{ ResourceId=$op.ResourceId; IsSuccess=$op.IsSuccess; Error=$err; ProcessedAt=$op.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$op.Status } }
 }
 
-# Invoke fault and recovery
-$success = Invoke-AksZoneFault -ResourceGroup $info.ResourceGroup -ClusterName $info.ClusterName -DurationInMinutes $DurationInMinutes
-
-if ($success) {
-    Write-Log "AKS zone fault operation completed" "SUCCESS"
-} else {
-    Write-Log "AKS zone fault operation failed or no action taken" "ERROR"
-    throw "AKS zone fault injection failed" }
-
-Write-Log "===== Script execution finished =====" "INFO"
+$executionResult = [ordered]@{
+    Status=$overallStatus
+    ResourceResults=$resourceResults
+    SuccessCount=$successCount
+    FailureCount=$failureCount
+    ExecutionStartTime=$scriptStart.ToUniversalTime()
+    ExecutionEndTime=$scriptEnd.ToUniversalTime()
+    GlobalError= if ($overallStatus -eq 'Failed') { 'All AKS zone fault operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some AKS zone fault operations failed.' } else { $null }
+}
+$executionJson = $executionResult | ConvertTo-Json -Depth 6
+Write-Output $executionJson
+# Write-Log "Overall Status: $overallStatus (Success=$successCount Failure=$failureCount)" 'INFO'
+# Write-Log "===== AKS Zone Fault Injection Finished =====" 'INFO'
 #endregion
