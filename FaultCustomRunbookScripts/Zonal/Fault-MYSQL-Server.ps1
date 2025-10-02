@@ -44,24 +44,29 @@
     - All operations are logged with timestamps and severity levels
     - Logs are written to Azure Automation output streams for monitoring
 #>
-
 #Requires -Modules Az.Accounts
+#Requires -Version 7.0
 
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $true, HelpMessage = "Comma separated resource IDs of the Azure MySQL Flexible Servers")]
     [ValidateNotNullOrEmpty()]
     [string]$ResourceIds,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
+    [ValidateNotNullOrEmpty()]
+    [long]$Duration,
 
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
 )
 
-#region Functions
+$functions = {
+    #region Functions
 
-<#
-.SYNOPSIS
-    Writes structured log messages for Azure Runbook execution context.
+    <#
+    .SYNOPSIS
+        Writes structured log messages for Azure Runbook execution context.
 
 .DESCRIPTION
     This function provides standardized logging capabilities for Azure Automation Runbooks.
@@ -95,24 +100,14 @@ function Write-Log {
         [string]$Level = "INFO"
     )
     
-    # Create timestamp for log entry
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
     
-    # Write to appropriate Azure Runbook output stream based on severity level
     switch ($Level) {
-        "INFO" { 
-            Write-Information $logEntry -InformationAction Continue
-        }
-        "WARNING" { 
-            Write-Warning $logEntry 
-        }
-        "ERROR" { 
-            Write-Error $logEntry 
-        }
-        "SUCCESS" { 
-            Write-Information $logEntry -InformationAction Continue
-        }
+        "INFO"    { Write-Information $logEntry -InformationAction Continue }
+        "WARNING" { Write-Warning $logEntry }
+        "ERROR"   { Write-Error $logEntry }
+        "SUCCESS" { Write-Information $logEntry -InformationAction Continue }
     }
 }
 
@@ -150,22 +145,15 @@ function ConvertFrom-ResourceId {
         [string]$ResourceId
     )
     
-    try {
-        # Use regex to extract components from MySQL Flexible Server resource ID
-        # Expected format: /subscriptions/{guid}/resourceGroups/{name}/providers/Microsoft.DBforMySQL/flexibleServers/{name}
-        if ($ResourceId -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.DBforMySQL/flexibleServers/([^/]+)") {
-            return @{
-                SubscriptionId = $Matches[1]
-                ResourceGroup = $Matches[2]
-                ServerName = $Matches[3]
-            }
-        }
-        else {
-            throw "Invalid resource ID format. Expected format: /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.DBforMySQL/flexibleServers/{server-name}"
+    if ($ResourceId -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.DBforMySQL/flexibleServers/([^/]+)") {
+        return @{
+            SubscriptionId = $Matches[1]
+            ResourceGroup = $Matches[2]
+            ServerName = $Matches[3]
         }
     }
-    catch {
-        throw "Failed to parse resource ID: $_"
+    else {
+        throw "Invalid resource ID format. Expected format: /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.DBforMySQL/flexibleServers/{server-name}"
     }
 }
 
@@ -207,16 +195,13 @@ function Connect-ToAzure {
             Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
         }
         
-        Write-Log "Connect command executed" "SUCCESS"
-        # Verify connection was successful
         $context = Get-AzContext -ErrorAction Stop
-        Write-Log "Successfully connected to Azure using Managed Identity" "SUCCESS"
-        Write-Log "Connected as: $($context.Account.Id) in subscription: $($context.Subscription.Name)" "INFO"
+        Write-Log "Successfully connected to Azure as $($context.Account.Id) in subscription: $($context.Subscription.Name)" "SUCCESS"
         return $true
     }
     catch {
         Write-Log "Failed to authenticate to Azure: $($_.Exception.Message)" "ERROR"
-        return $false
+        throw "Azure authentication failed: $($_.Exception.Message)"
     }
 }
 
@@ -274,7 +259,7 @@ function Initialize-RequiredModules {
     }
     catch {
         Write-Log "Failed to initialize required modules: $($_.Exception.Message)" "ERROR"
-        return $false
+        throw "Module initialization failed: $($_.Exception.Message)"
     }
 }
 
@@ -327,75 +312,61 @@ function Wait-ForAsyncOperation {
         [int]$InitialDelaySeconds = 30
     )
     
-    try {
-        $startTime = Get-Date
-        $maxWaitTime = $startTime.AddMinutes($MaxWaitTimeMinutes)
-        $delaySeconds = $InitialDelaySeconds
-        $maxDelaySeconds = 300 # Cap at 5 minutes
+    $startTime = Get-Date
+    $maxWaitTime = $startTime.AddMinutes($MaxWaitTimeMinutes)
+    $delaySeconds = $InitialDelaySeconds
+    $maxDelaySeconds = 300 # Cap at 5 minutes
+    
+    Write-Log "Starting async operation polling. Max wait time: $MaxWaitTimeMinutes minutes" "INFO"
+    
+    do {
+        Start-Sleep -Seconds $delaySeconds
         
-        Write-Log "Starting async operation polling. Max wait time: $MaxWaitTimeMinutes minutes" "INFO"
+        Write-Log "Polling async operation status..." "INFO"
+        $statusResponse = Invoke-WebRequest -Uri $AsyncOperationUrl -Method GET -Headers $Headers -UseBasicParsing -ErrorAction Stop
         
-        do {
-            Start-Sleep -Seconds $delaySeconds
+        if ($statusResponse.StatusCode -eq 200 -and $statusResponse.Content) {
+            $statusObj = $statusResponse.Content | ConvertFrom-Json -ErrorAction Stop
+            $status = $statusObj.status
             
-            Write-Log "Polling async operation status..." "INFO"
-            $statusResponse = Invoke-WebRequest -Uri $AsyncOperationUrl -Method GET -Headers $Headers -UseBasicParsing -ErrorAction Stop
+            Write-Log "Operation status: $status" "INFO"
             
-            if ($statusResponse.StatusCode -eq 200 -and $statusResponse.Content) {
-                $statusObj = $statusResponse.Content | ConvertFrom-Json -ErrorAction Stop
-                $status = $statusObj.status
-                
-                Write-Log "Operation status: $status" "INFO"
-                
-                switch ($status.ToLower()) {
-                    "succeeded" {
-                        Write-Log "Async operation completed successfully" "SUCCESS"
-                        return $true
+            switch ($status.ToLower()) {
+                "succeeded" {
+                    Write-Log "Async operation completed successfully" "SUCCESS"
+                    return $true
+                }
+                "failed" {
+                    $errorMessage = "Async operation failed."
+                    if ($statusObj.error) {
+                        $errorMessage += " Details: $($statusObj.error | ConvertTo-Json -Depth 2 -Compress)"
                     }
-                    "failed" {
-                        Write-Log "Async operation failed" "ERROR"
-                        if ($statusObj.error) {
-                            Write-Log "Operation error details: $($statusObj.error | ConvertTo-Json -Depth 2 -Compress)" "ERROR"
-                        }
-                        return $false
-                    }
-                    "canceled" {
-                        Write-Log "Async operation was canceled" "ERROR"
-                        return $false
-                    }
-                    "inprogress" {
-                        Write-Log "Operation still in progress. Continuing to poll..." "INFO"
-                        # Continue polling
-                    }
-                    "running" {
-                        Write-Log "Operation still running. Continuing to poll..." "INFO"
-                        # Continue polling
-                    }
-                    default {
-                        Write-Log "Unknown operation status: $status. Continuing to poll..." "WARNING"
-                        # Continue polling for unknown statuses
-                    }
+                    Write-Log $errorMessage "ERROR"
+                    throw $errorMessage
+                }
+                "canceled" {
+                    Write-Log "Async operation was canceled" "ERROR"
+                    throw "Async operation was canceled"
+                }
+                "inprogress" {
+                    Write-Log "Operation still in progress. Continuing to poll..." "INFO"
+                }
+                "running" {
+                    Write-Log "Operation still in progress. Continuing to poll..." "INFO"
+                }
+                default {
+                    Write-Log "Unknown operation status: $status. Continuing to poll..." "WARNING"
                 }
             }
-            else {
-                Write-Log "Unexpected response from async operation endpoint. Status: $($statusResponse.StatusCode)" "WARNING"
-            }
-            
-            # Implement exponential backoff (double the delay, up to max)
-            $delaySeconds = [Math]::Min($delaySeconds * 2, $maxDelaySeconds)
-            
-        } while ((Get-Date) -lt $maxWaitTime)
-        
-        # Timed out
-        Write-Log "Async operation polling timed out after $MaxWaitTimeMinutes minutes" "ERROR"
-        Write-Log "Last known status was: $status" "ERROR"
-        return $false
-    }
-    catch {
-        Write-Log "Error while polling async operation: $($_.Exception.Message)" "ERROR"
-        Write-Log "Full error details: $($_ | Out-String)" "ERROR"
-        return $false
-    }
+        }
+        else {
+            Write-Log "Unexpected response status code: $($statusResponse.StatusCode). Response content: $($statusResponse.Content)" "ERROR"
+            throw "Unexpected response status code: $($statusResponse.StatusCode)"
+        }
+    } while (Get-Date -lt $maxWaitTime)
+    
+    Write-Log "Async operation polling timed out after $MaxWaitTimeMinutes minutes" "ERROR"
+    return $false
 }
 
 <#
@@ -430,7 +401,7 @@ function Wait-ForAsyncOperation {
 #>
 function Invoke-MySQLServerFailover {
     [CmdletBinding()]
-    [OutputType([bool])]
+    [OutputType([pscustomobject])]
     param (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -440,239 +411,218 @@ function Invoke-MySQLServerFailover {
         [ValidateNotNullOrEmpty()]
         [string]$ServerName,
         
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $true)]
         [string]$SubscriptionId
     )
     
     try {
         Write-Log "Initiating unplanned failover for MySQL server '$ServerName' in resource group '$ResourceGroupName'..." "INFO"
         
-        # Get the current Azure context to obtain access token
-        $context = Get-AzContext -ErrorAction Stop
-        if (-not $context) {
-            throw "No Azure context available. Please authenticate first."
-        }
-        
-        # Get access token for REST API calls using modern approach
         $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
         
-        # Handle both SecureString (newer versions) and String (older versions) token formats
         if ($accessToken.Token -is [System.Security.SecureString]) {
-            # Convert SecureString to plain text for REST API use
-            Write-Log "Converting SecureString token to plain text for REST API use" "INFO"
             $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($accessToken.Token)
             try {
                 $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
             }
             finally {
-                # Always clear the BSTR from memory for security
                 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
             }
         } else {
-            # Token is already a string (common in older Az.Accounts versions or PS 5.1)
-            Write-Log "Using plain text token from Get-AzAccessToken" "INFO"
             $token = $accessToken.Token
         }
         
-        # Construct the REST API endpoint
         $apiVersion = "2023-12-30"
         $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DBforMySQL/flexibleServers/$ServerName/failover?api-version=$apiVersion"
         
-        Write-Log "Calling MySQL failover REST API endpoint: $uri" "INFO"
+        Write-Log "Calling MySQL failover REST API endpoint..." "INFO"
         
-        # Prepare headers for REST API call
         $headers = @{
             'Authorization' = "Bearer $token"
             'Content-Type' = 'application/json'
         }
         
-        # Execute the failover REST API call
-        # This is a POST request with no body required
         $response = Invoke-WebRequest -Uri $uri -Method POST -Headers $headers -UseBasicParsing -ErrorAction Stop
         
         Write-Log "API Response Status Code: $($response.StatusCode)" "INFO"
         
-        # Check the HTTP status code to determine operation result
-        if ($response.StatusCode -eq 200) {
-            Write-Log "Successfully completed failover for MySQL server '$ServerName' (HTTP 200)" "SUCCESS"
-            Write-Log "Failover operation response: $($response.Content)" "INFO"
-            return $true
-        }
-        elseif ($response.StatusCode -eq 202) {
-            Write-Log "Successfully initiated failover for MySQL server '$ServerName' (HTTP 202 - Accepted)" "INFO"
-            Write-Log "Long-running operation started. Tracking operation to completion..." "INFO"
+        if ($response.StatusCode -in (200, 202)) {
+            Write-Log "Successfully initiated failover for MySQL server '$ServerName' (HTTP $($response.StatusCode))" "INFO"
             
-            # Get async operation tracking URLs
-            $asyncOperationUrl = $response.Headers['Azure-AsyncOperation']
-            $locationUrl = $response.Headers['Location']
-            
-            if ($asyncOperationUrl) {
-                Write-Log "Azure-AsyncOperation URL: $asyncOperationUrl" "INFO"
-                
-                # Poll the async operation status until completion
-                $operationResult = Wait-ForAsyncOperation -AsyncOperationUrl $asyncOperationUrl -Headers $headers
-                
-                if ($operationResult) {
-                    Write-Log "Failover operation completed successfully" "SUCCESS"
-                    return $true
-                } else {
-                    Write-Log "Failover operation failed during execution" "ERROR"
-                    return $false
-                }
+            $asyncOperationUrl = $null
+            if ($response.Headers['Azure-AsyncOperation']) {
+                $asyncOperationUrl = @($response.Headers['Azure-AsyncOperation'])[0]
             }
-            elseif ($locationUrl) {
-                Write-Log "Location URL: $locationUrl" "INFO"
-                Write-Log "Note: Only Location header available. Operation initiated successfully but final status not tracked." "WARNING"
-                return $true
+            elseif ($response.Headers['azure-asyncoperation']) {
+                $asyncOperationUrl = @($response.Headers['azure-asyncoperation'])[0]
+            }
+            elseif ($response.Headers['Location']) {
+                $asyncOperationUrl = @($response.Headers['Location'])[0]
+                Write-Log "Azure-AsyncOperation header not found. Falling back to Location header for polling." "WARNING"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($asyncOperationUrl)) {
+                Write-Log "Polling async status endpoint: $asyncOperationUrl" "INFO"
+                Wait-ForAsyncOperation -AsyncOperationUrl $asyncOperationUrl -Headers $headers
             }
             else {
-                Write-Log "No tracking URLs provided. Operation initiated but cannot track completion." "WARNING"
-                Write-Log "Failover operation response: $($response.Content)" "INFO"
-                return $true
+                Write-Log "Async operation status URL not provided by service; skipping polling." "WARNING"
             }
+            
+            Write-Log "Failover operation for '$ServerName' completed successfully." "SUCCESS"
+            return [pscustomobject]@{ IsSuccess = $true; Status = 'Succeeded'; Message = $null }
         }
         else {
-            Write-Log "Unexpected status code $($response.StatusCode) from failover API" "WARNING"
-            Write-Log "Response content: $($response.Content)" "WARNING"
-            return $false
+            throw "Unexpected status code $($response.StatusCode) from failover API. Response: $($response.Content)"
         }
     }
     catch {
-        Write-Log "Failed to failover MySQL server '$ServerName': $($_.Exception.Message)" "ERROR"
-        
-        # Handle HTTP response errors with PowerShell 5.1 compatibility
-        if ($_.Exception -and $_.Exception.Response) {
-            try {
-                $statusCode = $_.Exception.Response.StatusCode
-                Write-Log "HTTP Status Code: $statusCode" "ERROR"
-                
-                # Try to get response content - different methods for different PS versions
-                $responseContent = $null
-                if ($_.Exception.Response.Content) {
-                    $responseContent = $_.Exception.Response.Content
-                } elseif ($_.Exception.Response.GetResponseStream) {
-                    $responseStream = $_.Exception.Response.GetResponseStream()
-                    $reader = New-Object System.IO.StreamReader($responseStream)
-                    $responseContent = $reader.ReadToEnd()
-                    $reader.Close()
-                    $responseStream.Close()
-                }
-                
-                if ($responseContent) {
-                    try {
-                        $errorObj = $responseContent | ConvertFrom-Json -ErrorAction Stop
-                        Write-Log "API Error Response: $($errorObj | ConvertTo-Json -Depth 3 -Compress)" "ERROR"
-                    }
-                    catch {
-                        Write-Log "Raw API Error Response: $responseContent" "ERROR"
-                    }
-                }
-            }
-            catch {
-                Write-Log "Could not extract detailed error information from HTTP response" "ERROR"
-            }
-        }
-        
-        Write-Log "Full error details: $($_ | Out-String)" "ERROR"
-        return $false
+        $errorMessage = "Failed to failover MySQL server '$ServerName': $($_.Exception.Message)"
+        Write-Log $errorMessage "ERROR"
+        return [pscustomobject]@{ IsSuccess = $false; Status = 'Failed'; Message = $errorMessage }
     }
 }
 
 #endregion Functions
+}
 
 #region Main Script Execution
+# Set InformationPreference to Continue to see Write-Information logs in automation job streams.
+$InformationPreference = 'Continue'
 
-<#
-    MAIN SCRIPT EXECUTION SECTION
-    
-    This section contains the primary script logic that orchestrates the MySQL
-    server failover process. It follows these main steps:
-    
-    1. Initialize script execution with logging
-    2. Authenticate to Azure using Managed Identity
-    3. Parse the provided resource ID to extract server details
-    4. Validate and import required PowerShell modules
-    5. Execute the failover operation using REST API
-    6. Provide operation summary and results
-    
-    All operations include comprehensive error handling and logging for Azure
-    Automation monitoring and troubleshooting purposes.
-#>
-
-# Script execution banner and initial setup
-Write-Log "============================================================" "INFO"
-Write-Log "AZURE MYSQL FLEXIBLE SERVER FAILOVER SCRIPT" "INFO"
-Write-Log "Version: 1.0 | Date: 2025-05-26" "INFO"
-Write-Log "============================================================" "INFO"
-Write-Log "Starting MySQL Flexible Server Failover operation..." "INFO"
-Write-Log "Raw Input: $ResourceIds" "INFO"
+Write-Information "============================================================"
+Write-Information "AZURE MYSQL FLEXIBLE SERVER FAILOVER SCRIPT"
+Write-Information "============================================================"
+Write-Information "Starting MySQL Flexible Server Failover operation..."
+Write-Information "Raw Input: $ResourceIds"
 $mysqlIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if (-not $mysqlIds -or $mysqlIds.Count -eq 0) { throw "No valid MySQL server resource IDs provided" }
-Write-Log "Parsed $($mysqlIds.Count) MySQL server id(s)." 'INFO'
+Write-Information "Parsed $($mysqlIds.Count) MySQL server id(s)."
 
-if (-not (Connect-ToAzure -ClientId $UAMIClientId)) { throw "Authentication failed" }
-if (-not (Initialize-RequiredModules)) { throw "Module init failed" }
+# Initial connection check in main thread
+try {
+    if ($UAMIClientId) {
+        Connect-AzAccount -Identity -AccountId $UAMIClientId -ErrorAction Stop | Out-Null
+    } else {
+        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+    }
+    $ctx = Get-AzContext -ErrorAction Stop
+    Write-Information "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
+} catch {
+    throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
+}
 
 $scriptStart = Get-Date
 
-# Capture function definitions for parallel execution
-$functionDefs = @"
-$(Get-Content Function:\Write-Log -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+Write-Information "Starting parallel processing of $($mysqlIds.Count) MySQL servers"
 
-$(Get-Content Function:\ConvertFrom-ResourceId -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
+$functionsScript = $functions.ToString()
 
-$(Get-Content Function:\Connect-ToAzure -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
-
-$(Get-Content Function:\Initialize-RequiredModules -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
-
-$(Get-Content Function:\Wait-ForAsyncOperation -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
-
-$(Get-Content Function:\Invoke-MySQLServerFailover -ErrorAction SilentlyContinue | ForEach-Object { $_.Definition })
-"@
-
-$results = $mysqlIds | ForEach-Object -Parallel {
-    # Re-create function definitions in parallel runspace
-    Invoke-Expression $using:functionDefs
+$resultsRaw = $mysqlIds | ForEach-Object -Parallel {
+    # Set InformationPreference in the parallel runspace so Write-Information logs appear
+    $InformationPreference = 'Continue'
+    
+    # Define functions in the parallel runspace
+    $functionBlock = [scriptblock]::Create($using:functionsScript)
+    . $functionBlock
     
     $rid = $_
-    Write-Log "Processing MySQL Server: $rid" 'INFO'
-    $parseErr = $null
-    $info = $null
     $start = Get-Date
-    try { $info = ConvertFrom-ResourceId -ResourceId $rid } catch { $parseErr = $_.Exception.Message }
-    if ($parseErr) {
-        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$parseErr; StartTime=$start; EndTime=$start; Status='FailedToStart' }
+    $result = [pscustomobject]@{
+        ResourceId = $rid
+        IsSuccess = $false
+        ErrorMessage = $null
+        StartTime = $start
+        EndTime = $start
+        Status = 'FailedToStart'
     }
+
     try {
-        # Re-authenticate within parallel runspace
-        if (-not (Connect-ToAzure -ClientId $using:UAMIClientId)) { 
-            throw "Authentication failed in parallel runspace" 
-        }
-        if (-not (Initialize-RequiredModules)) { 
-            throw "Module initialization failed in parallel runspace" 
-        }
+        # Authenticate and initialize modules in the parallel runspace
+        Connect-ToAzure -ClientId $using:UAMIClientId | Out-Null
+        Initialize-RequiredModules | Out-Null
+
+        # Parse resource ID
+        $info = ConvertFrom-ResourceId -ResourceId $rid
         
-        if ($info.SubscriptionId) { Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null }
-        $success = Invoke-MySQLServerFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -SubscriptionId $info.SubscriptionId
+        # Switch subscription context if needed
+        $currentSub = (Get-AzContext).Subscription.Id
+        if ($info.SubscriptionId -and $currentSub -ne $info.SubscriptionId) {
+            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
+            Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
+        }
+
+        $faultResult = Invoke-MySQLServerFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -SubscriptionId $info.SubscriptionId
         $end = Get-Date
-        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$success; ErrorMessage= if ($success) { $null } else { 'MySQL server failover failed' }; StartTime=$start; EndTime=$end; Status= (if ($success) { 'Succeeded' } else { 'Failed' }) }
+
+        $result.IsSuccess = $faultResult.IsSuccess
+        $result.ErrorMessage = $faultResult.Message
+        $result.EndTime = $end
+        $result.Status = $faultResult.Status
+
     } catch { 
-        $end = Get-Date
-        return [pscustomobject]@{ ResourceId=$rid; IsSuccess=$false; ErrorMessage=$_.Exception.Message; StartTime=$start; EndTime=$end; Status='Failed' } 
+        $result.EndTime = Get-Date
+        $result.ErrorMessage = $_.Exception.Message
+        $result.Status = 'Failed'
     }
-} -ThrottleLimit ([System.Environment]::ProcessorCount)
+    return $result
+
+}
+
+$resultsRaw = @($resultsRaw | Where-Object { $_ })
+$results = @()
+$unexpectedOutputs = @()
+
+foreach ($item in $resultsRaw) {
+    if ($item -is [pscustomobject] -and $item.PSObject.Properties['ResourceId']) {
+        $results += $item
+    }
+    else {
+        $unexpectedOutputs += $item
+        Write-Information "Captured unexpected output item of type '$($item.GetType().FullName)'." -InformationAction Continue
+    }
+}
+
+if ($unexpectedOutputs.Count -gt 0) {
+    Write-Information "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing." -InformationAction Continue
+}
+
+if ($results.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
+    Write-Warning "Parallel processing returned no valid result objects. Check unexpected outputs for details."
+}
 
 $scriptEnd = Get-Date
 $successCount = ($results | Where-Object { $_.IsSuccess }).Count
 $failureCount = ($results | Where-Object { -not $_.IsSuccess }).Count
+$failureCount += $unexpectedOutputs.Count
 $overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
 
 $resourceResults = @()
 foreach ($r in $results) {
-    $durationMs = [int]([Math]::Round((($r.EndTime) - $r.StartTime).TotalMilliseconds))
+    if (-not $r) { continue }
+    $endTime = if ($r.EndTime) { $r.EndTime } elseif ($r.StartTime) { $r.StartTime } else { Get-Date }
+    $startTime = if ($r.StartTime) { $r.StartTime } else { $endTime }
+    try {
+        if ($endTime -isnot [DateTime]) {
+            $endTime = [DateTime]::Parse($endTime.ToString(), [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($startTime -isnot [DateTime]) {
+            $startTime = [DateTime]::Parse($startTime.ToString(), [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    } catch {
+        $endTime = Get-Date
+        $startTime = $endTime
+    }
+    $durationMs = [int]([Math]::Round((($endTime) - $startTime).TotalMilliseconds))
     $err = $null
     if (-not $r.IsSuccess) { $err = @{ ErrorCode='FailedToFaultResource'; Message=$r.ErrorMessage; Details=$r.ErrorMessage; Category=$r.Status; IsRetryable=$false } }
-    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$r.EndTime.ToUniversalTime(); ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status } }
+    $processedAtUtc = $endTime.ToUniversalTime()
+    $resourceResults += @{ ResourceId=$r.ResourceId; IsSuccess=$r.IsSuccess; Error=$err; ProcessedAt=$processedAtUtc; ProcessingDurationMs=$durationMs; Metadata=@{ Status=$r.Status } }
+}
+
+foreach ($unexpected in $unexpectedOutputs) {
+    $details = ($unexpected | Out-String).Trim()
+    $resourceResults += @{ ResourceId = $null; IsSuccess = $null; Error = @{ ErrorCode = 'UnexpectedOutput'; Message = if ($details) { $details } else { $unexpected.ToString() }; Details = $details; Category = $null; IsRetryable = $false }; ProcessedAt = (Get-Date).ToUniversalTime(); ProcessingDurationMs = 0; Metadata = @{ Status = $null } }
 }
 $executionResult = [ordered]@{
     Status=$overallStatus
@@ -686,6 +636,13 @@ $executionResult = [ordered]@{
 $executionJson = $executionResult | ConvertTo-Json -Depth 6
 Write-Output $executionJson
 
-# Write-Log "Script execution completed" "INFO"
+# Fail the runbook if any resource could not be faulted
+if ($failureCount -gt 0) {
+    $errorMsg = "Runbook failed: $failureCount out of $($mysqlIds.Count) MySQL server(s) could not be faulted. Status: $overallStatus"
+    Write-Error $errorMsg -ErrorAction Stop
+    throw $errorMsg
+}
+
+Write-Information "All MySQL server failover operations completed successfully." -InformationAction Continue
 
 #endregion Main Script Execution
