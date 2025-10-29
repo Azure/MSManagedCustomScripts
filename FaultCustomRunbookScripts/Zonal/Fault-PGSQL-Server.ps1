@@ -301,16 +301,12 @@ $functions = {
         try {
             Write-Log "Initiating unplanned restart with failover for server '$ServerName' in resource group '$ResourceGroupName'..." "INFO"
             
-            $restartResult = Restart-AzPostgreSqlFlexibleServer `
+            Restart-AzPostgreSqlFlexibleServer `
                 -ResourceGroupName $ResourceGroupName `
                 -Name $ServerName `
                 -RestartWithFailover `
                 -FailoverMode ForcedFailover `
                 -ErrorAction Stop
-            
-            if (-not $restartResult) {
-                throw "Restart-AzPostgreSqlFlexibleServer returned null or empty result. The restart may not have been initiated."
-            }
                 
             Write-Log "Successfully initiated failover for server '$ServerName'" "SUCCESS"
             return [pscustomobject]@{ IsSuccess = $true; Status = 'Succeeded'; Message = "Restart with failover initiated successfully" }
