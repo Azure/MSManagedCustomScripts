@@ -59,7 +59,10 @@ param (
 
     [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
     [ValidateNotNullOrEmpty()]
-    [long]$Duration
+    [long]$Duration,
+
+    [Parameter(Mandatory=$false, HelpMessage="Optional target availability zone hint (informational only).")]
+    [string]$TargetZone
 )
 
 $functions = {
