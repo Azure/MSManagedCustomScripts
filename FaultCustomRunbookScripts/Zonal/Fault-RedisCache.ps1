@@ -58,6 +58,9 @@ param (
     [ValidateNotNullOrEmpty()]
     [long]$Duration,
 
+    [Parameter(Mandatory=$false, HelpMessage="Optional target availability zone hint (informational only).")]
+    [string]$TargetZone,
+
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
 )

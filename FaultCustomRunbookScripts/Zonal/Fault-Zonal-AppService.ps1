@@ -53,7 +53,7 @@ param (
     [string]$ResourceIds,
 
     [Parameter(Mandatory = $false, HelpMessage="Zone on which fault will get induced.")]
-    [string]$Zone = "1",
+    [string]$TargetZone = "1",
 
     [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
     [ValidateNotNullOrEmpty()]
@@ -365,7 +365,7 @@ $functions = {
                 properties = @{
                     faultKind = "Zone"
                     zoneFaultSimulationParameters = @{
-                        zones = @($Zone)
+                        zones = @($TargetZone)
                     }
                     faultSimulationConstraints = @{
                         expirationTime = $expirationTime

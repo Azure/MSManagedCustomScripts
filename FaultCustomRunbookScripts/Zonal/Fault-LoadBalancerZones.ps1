@@ -29,6 +29,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [long]$Duration,
 
+    [Parameter(Mandatory=$false, HelpMessage="Optional target availability zone to fault (e.g. '1'). Leave empty to fault all zones.")]
+    [string]$TargetZone,
+
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
 )
@@ -110,7 +113,8 @@ $functions = {
         param(
             [string]$ResourceGroup,
             [string]$LBName,
-            [TimeSpan]$Duration
+            [TimeSpan]$Duration,
+            [string]$TargetZone
         )
         try {
             Write-Log "Retrieving Load Balancer '$LBName' in RG '$ResourceGroup'" "INFO"
@@ -119,6 +123,7 @@ $functions = {
             # Identify probes to override by finding probes associated with zoned backends
             $probesToOverride = @()
             $backendPools = $lb.BackendAddressPools
+            $targetZoneTrimmed = if ([string]::IsNullOrWhiteSpace($TargetZone)) { $null } else { $TargetZone.Trim() }
             if ($null -ne $backendPools) {
                 foreach ($pool in $backendPools) {
                     # A backend pool can have multiple NICs. Check each one.
@@ -127,15 +132,22 @@ $functions = {
                         foreach ($ipConfig in $backendIpConfigs) {
                             $nic = Get-AzNetworkInterface -ResourceId $ipConfig.Id -ErrorAction SilentlyContinue
                             if ($nic -and $nic.Zones) {
-                                Write-Log "Found zoned backend NIC '$($nic.Name)' in pool '$($pool.Name)' (zones: $($nic.Zones -join ','))" "INFO"
-                                # Find the probe associated with this pool via load balancing rules
-                                $rules = $lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id }
-                                if ($rules) {
-                                    $probeIds = $rules.Probe.Id | Select-Object -Unique
-                                    $probesToOverride += $lb.Probes | Where-Object { $probeIds -contains $_.Id }
+                                $nicZones = $nic.Zones
+                                $zoneMatch = $true
+                                if ($targetZoneTrimmed) {
+                                    $zoneMatch = $nicZones -contains $targetZoneTrimmed
                                 }
-                                # Break from inner loop once a zoned NIC is found for this pool
-                                break
+                                if ($zoneMatch) {
+                                    Write-Log "Found zoned backend NIC '$($nic.Name)' in pool '$($pool.Name)' (zones: $($nic.Zones -join ','))" "INFO"
+                                    # Find the probe associated with this pool via load balancing rules
+                                    $rules = $lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id }
+                                    if ($rules) {
+                                        $probeIds = $rules.Probe.Id | Select-Object -Unique
+                                        $probesToOverride += $lb.Probes | Where-Object { $probeIds -contains $_.Id }
+                                    }
+                                    # Break from inner loop once a zoned NIC is found for this pool
+                                    break
+                                }
                             }
                         }
                     }
@@ -224,6 +236,11 @@ $resultsRaw = $lbIds | ForEach-Object -Parallel {
     . $functionBlock
 
     $rid = $_
+    $targetZoneValue = $null
+    if ($using:TargetZone) {
+        $targetZoneValue = ($using:TargetZone).Trim()
+        if (-not $targetZoneValue) { $targetZoneValue = $null }
+    }
     $start = Get-Date
     $result = [pscustomobject]@{
         ResourceId = $rid
@@ -249,7 +266,7 @@ $resultsRaw = $lbIds | ForEach-Object -Parallel {
             Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
         }
 
-        $faultResult = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $using:DurationTimeSpan
+        $faultResult = Override-LoadBalancerHealthProbes -ResourceGroup $info.ResourceGroup -LBName $info.LBName -Duration $using:DurationTimeSpan -TargetZone $targetZoneValue
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess

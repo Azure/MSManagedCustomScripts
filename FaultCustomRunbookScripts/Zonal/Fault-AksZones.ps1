@@ -29,6 +29,9 @@ param(
     [Alias("DurationInMinutes")]
     [int]$Duration,
 
+    [Parameter(Mandatory=$false, HelpMessage="Optional target availability zone to fault (e.g. '1'). Leave empty to fault all zones.")]
+    [string]$TargetZone,
+
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
 )
@@ -117,13 +120,22 @@ $functions = {
             [string]$ResourceGroup,
             [string]$ClusterName,
             [Alias("DurationInMinutes")]
-            [int]$Duration
+            [int]$Duration,
+            [string]$TargetZone
         )
         try {
             Write-Log "Retrieving node pools for cluster '$ClusterName' in RG '$ResourceGroup'" "INFO"
             $nodePools = Get-AzAksNodePool -ResourceGroupName $ResourceGroup -ClusterName $ClusterName -ErrorAction Stop
 
             $zonedPools = $nodePools | Where-Object { $_.AvailabilityZones -and $_.AvailabilityZones.Count -gt 0 }
+            $targetZoneTrimmed = if ([string]::IsNullOrWhiteSpace($TargetZone)) { $null } else { $TargetZone.Trim() }
+            if ($targetZoneTrimmed) {
+                $zonedPools = $zonedPools | Where-Object { $_.AvailabilityZones -contains $targetZoneTrimmed }
+                if (-not $zonedPools) {
+                    Write-Log "No zoned node pools found for cluster '$ClusterName' in target zone '$targetZoneTrimmed'. Nothing to fault." "WARNING"
+                    return [pscustomobject]@{ IsSuccess = $false; Status = 'Skipped'; Message = "No zoned node pools found in target zone '$targetZoneTrimmed'."; TargetZone = $targetZoneTrimmed }
+                }
+            }
             if (-not $zonedPools) {
                 Write-Log "No zoned node pools found for cluster '$ClusterName'. Nothing to fault." "WARNING"
                 # Returning a custom object to indicate skipped status
