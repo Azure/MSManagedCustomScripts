@@ -106,10 +106,10 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Verbose $logEntry -InformationAction Continue }
+            "INFO"    { Write-Verbose $logEntry}
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Verbose $logEntry -InformationAction Continue }
+            "SUCCESS" { Write-Verbose $logEntry}
         }
     }
 
