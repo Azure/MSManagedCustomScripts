@@ -108,10 +108,10 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Information $logEntry -InformationAction Continue }
+            "INFO"    { Write-Verbose $logEntry }
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Information $logEntry -InformationAction Continue }
+            "SUCCESS" { Write-Verbose $logEntry }
         }
     }
 
@@ -186,7 +186,8 @@ $functions = {
         [CmdletBinding()]
         [OutputType([bool])]
         param(
-            [string]$ClientId
+            [string]$ClientId,
+            [string]$SubscriptionId
         )
         
         try {
@@ -197,6 +198,12 @@ $functions = {
             else {
                 Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
                 Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+            }
+
+            # If a subscription ID is provided, set the context to that subscription immediately
+            if (-not [string]::IsNullOrEmpty($SubscriptionId)) {
+                Write-Log "Setting subscription context to $SubscriptionId" "INFO"
+                Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             }
             
             $context = Get-AzContext -ErrorAction Stop
@@ -325,43 +332,43 @@ $functions = {
 }
 
 #region Main Script Execution
-# Set InformationPreference to Continue to see Write-Information logs in automation job streams.
-$InformationPreference = 'Continue'
+# Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
+$VerbosePreference = 'Continue'
 
-Write-Information "============================================================"
-Write-Information "AZURE POSTGRESQL FLEXIBLE SERVER FAILOVER SCRIPT"
-Write-Information "============================================================"
-Write-Information "Starting PostgreSQL Flexible Server Failover operation..."
-Write-Information "Raw Input: $ResourceIds"
+Write-Verbose "============================================================"
+Write-Verbose "AZURE POSTGRESQL FLEXIBLE SERVER FAILOVER SCRIPT"
+Write-Verbose "============================================================"
+Write-Verbose "Starting PostgreSQL Flexible Server Failover operation..."
+Write-Verbose "Raw Input: $ResourceIds"
 
 $pgIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if (-not $pgIds -or $pgIds.Count -eq 0) { throw "No valid PostgreSQL resource IDs provided" }
-Write-Information "Parsed $($pgIds.Count) PostgreSQL server id(s)."
+Write-Verbose "Parsed $($pgIds.Count) PostgreSQL server id(s)."
 
 $scriptStart = Get-Date
 $opResults = @()
 
 # Initial connection check in main thread
 try {
-    Write-Information "Authenticating to Azure..."
+    Write-Verbose "Authenticating to Azure..."
     if ($UAMIClientId) {
         Connect-AzAccount -Identity -AccountId $UAMIClientId -ErrorAction Stop | Out-Null
     } else {
         Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
-    Write-Information "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
+    Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
 } catch {
     throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
 }
 
-Write-Information "Starting parallel processing of $($pgIds.Count) PostgreSQL servers."
+Write-Verbose "Starting parallel processing of $($pgIds.Count) PostgreSQL servers."
 
 $functionsScript = $functions.ToString()
 
 $opResultsRaw = $pgIds | ForEach-Object -Parallel {
-    # Set InformationPreference in the parallel runspace so Write-Information logs appear
-    $InformationPreference = 'Continue'
+    # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
+    $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
     $functionBlock = [scriptblock]::Create($using:functionsScript)
@@ -378,19 +385,12 @@ $opResultsRaw = $pgIds | ForEach-Object -Parallel {
         Status = 'FailedToStart'
     }
     try {
-        # Authenticate and initialize modules in the parallel runspace
-        Connect-ToAzure -ClientId $using:UAMIClientId | Out-Null
-        Initialize-RequiredModules | Out-Null
-
-        # Parse resource ID
+        # Parse resource ID first to get the subscription
         $info = ConvertFrom-ResourceId -ResourceId $rid
 
-        # Switch subscription context if needed
-        $currentSub = (Get-AzContext).Subscription.Id
-        if ($info.SubscriptionId -and $currentSub -ne $info.SubscriptionId) {
-            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-            Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
-        }
+        # Authenticate and initialize modules in the parallel runspace, passing the target subscription
+        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $info.SubscriptionId | Out-Null
+        Initialize-RequiredModules | Out-Null
 
         $faultResult = Restart-PostgreSQLServerWithFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -SubscriptionId $info.SubscriptionId
         $end = Get-Date
@@ -418,12 +418,12 @@ foreach ($item in $opResultsRaw) {
     }
     else {
         $unexpectedOutputs += $item
-        Write-Information "Captured unexpected output item of type '$($item.GetType().FullName)'." -InformationAction Continue
+        Write-Verbose "Captured unexpected output item of type '$($item.GetType().FullName)'."
     }
 }
 
 if ($unexpectedOutputs.Count -gt 0) {
-    Write-Information "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing." -InformationAction Continue
+    Write-Verbose "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing."
 }
 
 if ($opResults.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
@@ -476,6 +476,6 @@ if ($failureCount -gt 0) {
     throw $errorMsg
 }
 
-Write-Information "All PostgreSQL server failover operations completed successfully." -InformationAction Continue
+Write-Verbose "All PostgreSQL server failover operations completed successfully."
 
 #endregion Main Script Execution

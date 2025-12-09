@@ -106,10 +106,10 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Information $logEntry -InformationAction Continue }
+            "INFO"    { Write-Verbose $logEntry}
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Information $logEntry -InformationAction Continue }
+            "SUCCESS" { Write-Verbose $logEntry}
         }
     }
 
@@ -182,7 +182,9 @@ $functions = {
         [OutputType([bool])]
         param(
             [Parameter(Mandatory = $false)]
-            [string]$ClientId
+            [string]$ClientId,
+            [Parameter(Mandatory = $false)]
+            [string]$SubscriptionId
         )
         
         try {
@@ -192,6 +194,12 @@ $functions = {
             } else {
                 Write-Log "Authenticating to Azure using User-Assigned Managed Identity (ClientId: $ClientId)..." "INFO"
                 Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+            }
+
+            # If a subscription ID is provided, set the context to that subscription immediately
+            if (-not [string]::IsNullOrEmpty($SubscriptionId)) {
+                Write-Log "Setting subscription context to $SubscriptionId" "INFO"
+                Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             }
             
             $newContext = Get-AzContext -ErrorAction Stop
@@ -252,59 +260,6 @@ $functions = {
 
     <#
     .SYNOPSIS
-        Gets the environment Ids for the Azure App service resource IDs.
-
-    .DESCRIPTION
-        This function gets the app Service environment Ids.
-
-    .PARAMETER AppServiceResourceIds
-        The Azure app service resource IDs to process.
-
-    .OUTPUTS
-        Returns the list of ASE Ids.
-
-    .NOTES
-        Only supports Azure App service resource IDs.
-    #>
-    function Get-UniqueAppServiceEnvironmentIds {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)]
-            [string[]]$AppServiceResourceIds
-        )
-    
-        $aseIds = @()
-    
-        foreach ($rid in $AppServiceResourceIds) {
-            try {
-                Write-Log "Processing App service Resource Id $rid." "INFO"
-                # Parse resource ID to get resource group and app service name
-                if ($rid -match "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/sites/([^/]+)$") {
-                    $resourceGroup = $Matches[2]
-                    $appServiceName = $Matches[3]
-    
-                    $hostingEnvProfile = Get-AzWebApp -Name $appServiceName -ResourceGroupName $resourceGroup | Select-Object -ExpandProperty HostingEnvironmentProfile
-
-                    if ($hostingEnvProfile -and $hostingEnvProfile.Id) {
-                        Write-Log "Received App service environment Resource Id $($hostingEnvProfile.Id)" "INFO"
-                        $aseIds += $hostingEnvProfile.Id
-                    }
-                }
-                else {
-                    Write-Log "Invalid App Service resource ID format: $rid." "WARNING"
-                }
-            }
-            catch {              
-                Write-Log "Failed to get ASE ID for $rid $($_.Exception.Message)." "WARNING"
-            }
-        }
-    
-        Write-Log "Final App service environment Resource Id $aseIds" "INFO"
-        return $aseIds | Where-Object { $_ } | Select-Object -Unique
-    }
-
-    <#
-    .SYNOPSIS
         Performs a zonal fault on the app service.
 
     .DESCRIPTION
@@ -347,7 +302,7 @@ $functions = {
             Write-Log "Initiating zonal fault simulation on App server '$AppEnvName' in resource group '$ResourceGroupName'..." "INFO"
             
             $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
-            
+        
             if ($accessToken.Token -is [System.Security.SecureString]) {
                 $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($accessToken.Token)
                 try {
@@ -517,18 +472,18 @@ $functions = {
 }
 
 # region Main Script Execution
-# Set InformationPreference to Continue to see Write-Information logs in automation job streams.
-$InformationPreference = 'Continue'
+# Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
+$VerbosePreference = 'Continue'
 
-Write-Information "============================================================"
-Write-Information "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
-Write-Information "============================================================"
-Write-Information "Starting Azure app service zonal fault simulation..."
-Write-Information "Raw Input: $ResourceIds"
+Write-Verbose "============================================================"
+Write-Verbose "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
+Write-Verbose "============================================================"
+Write-Verbose "Starting Azure app service zonal fault simulation..."
+Write-Verbose "Raw Input: $ResourceIds"
 
 $appServiceIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if (-not $appServiceIds -or $appServiceIds.Count -eq 0) { throw "No valid app service resource IDs provided" }
-Write-Information "Parsed $($appServiceIds.Count) app service id(s)."
+Write-Verbose "Parsed $($appServiceIds.Count) app service id(s)."
 
 # Initial connection check in main thread
 try {
@@ -539,7 +494,7 @@ try {
         Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
-    Write-Information "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
+    Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
 }
 catch {
     throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
@@ -547,29 +502,24 @@ catch {
 
 $scriptStart = Get-Date
 
-Write-Information "Starting parallel processing of $($appServiceIds.Count) app services"
+Write-Verbose "Starting parallel processing of $($appServiceIds.Count) app services"
 
 . $functions
 $functionsScript = $functions.ToString()
 
-Initialize-RequiredModules | Out-Null
-
-$uniqueAseIds = Get-UniqueAppServiceEnvironmentIds -AppServiceResourceIds $appServiceIds
-Write-Log "Processing unique resource $uniqueAseIds" "INFO"
-
-#$resultsRaw = $uniqueAseIds | ForEach-Object -Parallel {
-foreach ($rid in $uniqueAseIds) {
-    # Set InformationPreference in the parallel runspace so Write-Information logs appear
-    $InformationPreference = 'Continue'
+# Process app service IDs in parallel - each runspace handles authentication, ASE lookup, and fault injection
+$resultsRaw = $appServiceIds | ForEach-Object -Parallel {
+    # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
+    $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
-    $functionBlock = [scriptblock]::Create($functionsScript)
+    $functionBlock = [scriptblock]::Create($using:functionsScript)
     . $functionBlock
     
-    #$rid = $_
+    $appServiceResourceId = $_
     $start = Get-Date
     $result = [pscustomobject]@{
-        ResourceId = $rid
+        ResourceId = $appServiceResourceId
         IsSuccess = $false
         ErrorMessage = $null
         StartTime = $start
@@ -578,21 +528,39 @@ foreach ($rid in $uniqueAseIds) {
     }
 
     try {
-        # Authenticate and initialize modules in the parallel runspace
-        Connect-ToAzure -ClientId $UAMIClientId | Out-Null
+        Write-Log "Processing App Service resource: $appServiceResourceId" "INFO"
         
-        Write-Log "Processing resource $rid" "INFO"
-        
-        $info = ConvertFrom-ResourceId -ResourceId $rid
-        
-        # Switch subscription context if needed
-        $currentSub = (Get-AzContext).Subscription.Id
-        if ($info.SubscriptionId -and $currentSub -ne $info.SubscriptionId) {
-            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-            Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
+        # Parse the App Service resource ID to get subscription, resource group, and app name
+        if ($appServiceResourceId -notmatch "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/sites/([^/]+)$") {
+            throw "Invalid App Service resource ID format: $appServiceResourceId"
         }
-
-        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $info.ResourceGroup -AppEnvName $info.AppEnvName -SubscriptionId $info.SubscriptionId
+        
+        $subscriptionId = $Matches[1]
+        $resourceGroup = $Matches[2]
+        $appServiceName = $Matches[3]
+        
+        # Authenticate and set subscription context in one call
+        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $subscriptionId | Out-Null
+        
+        # Initialize required modules
+        Initialize-RequiredModules | Out-Null
+        
+        # Get the ASE ID from the App Service
+        Write-Log "Getting ASE ID for App Service '$appServiceName' in resource group '$resourceGroup'" "INFO"
+        $hostingEnvProfile = Get-AzWebApp -Name $appServiceName -ResourceGroupName $resourceGroup -ErrorAction Stop | Select-Object -ExpandProperty HostingEnvironmentProfile
+        
+        if (-not $hostingEnvProfile -or -not $hostingEnvProfile.Id) {
+            throw "App Service '$appServiceName' is not hosted on an App Service Environment (ASE). Zonal fault simulation is only supported for ASE-hosted apps."
+        }
+        
+        $aseResourceId = $hostingEnvProfile.Id
+        Write-Log "Found ASE resource ID: $aseResourceId" "INFO"
+        
+        # Parse the ASE resource ID
+        $aseInfo = ConvertFrom-ResourceId -ResourceId $aseResourceId
+        
+        # Execute the zonal fault simulation
+        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
@@ -606,11 +574,12 @@ foreach ($rid in $uniqueAseIds) {
         $result.Status = 'Failed'
     }
 
-    $resultsRaw += $result
     return $result
 }
 
+# Ensure resultsRaw is an array
 $resultsRaw = @($resultsRaw | Where-Object { $_ })
+
 $results = @()
 $unexpectedOutputs = @()
 
@@ -620,12 +589,12 @@ foreach ($item in $resultsRaw) {
     }
     else {
         $unexpectedOutputs += $item
-        Write-Information "Captured unexpected output item of type '$($item.GetType().FullName)'." -InformationAction Continue
+        Write-Verbose "Captured unexpected output item of type '$($item.GetType().FullName)'."
     }
 }
 
 if ($unexpectedOutputs.Count -gt 0) {
-    Write-Information "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing." -InformationAction Continue
+    Write-Verbose "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing."
 }
 
 if ($results.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
@@ -685,6 +654,6 @@ if ($failureCount -gt 0) {
     throw $errorMsg
 }
 
-Write-Information "All zone fault simulation on AppService operations completed successfully." -InformationAction Continue
+Write-Verbose "All zone fault simulation on AppService operations completed successfully."
 
 #endregion Main Script Execution
