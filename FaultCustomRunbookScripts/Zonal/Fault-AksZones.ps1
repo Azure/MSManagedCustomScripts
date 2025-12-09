@@ -47,10 +47,10 @@ $functions = {
         $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $entry = "[$ts] [$Level] $Message"
         switch ($Level) {
-            "INFO"    { Write-Information $entry -InformationAction Continue }
+            "INFO"    { Write-Verbose $entry }
             "WARNING" { Write-Warning $entry }
             "ERROR"   { Write-Error $entry }
-            "SUCCESS" { Write-Information $entry -InformationAction Continue }
+            "SUCCESS" { Write-Verbose $entry }
         }
     }
     #endregion
@@ -70,7 +70,8 @@ $functions = {
     #region Authenticate and Module Init
     function Connect-ToAzure {
         param(
-            [string]$ClientId
+            [string]$ClientId,
+            [string]$SubscriptionId
         )
         try
         {
@@ -83,6 +84,12 @@ $functions = {
             {
                 Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
                 Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+            }
+
+            # If a subscription ID is provided, set the context to that subscription immediately
+            if (-not [string]::IsNullOrEmpty($SubscriptionId)) {
+                Write-Log "Setting subscription context to $SubscriptionId" "INFO"
+                Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             }
 
             $ctx = Get-AzContext -ErrorAction Stop
@@ -192,15 +199,15 @@ $functions = {
 }
 
 #region Main
-# Set InformationPreference to Continue to see Write-Information logs in automation job streams.
-$InformationPreference = 'Continue'
+# Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
+$VerbosePreference = 'Continue'
 
-Write-Information "===== Starting AKS Zone Fault Injection ====="
-Write-Information "Target AKS Raw Input: $ResourceIds"
+Write-Verbose "===== Starting AKS Zone Fault Injection ====="
+Write-Verbose "Target AKS Raw Input: $ResourceIds"
 
 $AksResourceList = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if (-not $AksResourceList -or $AksResourceList.Count -eq 0) { throw "No valid AKS resource IDs provided" }
-Write-Information "Parsed $($AksResourceList.Count) AKS resource id(s)."
+Write-Verbose "Parsed $($AksResourceList.Count) AKS resource id(s)."
 
 $scriptStart = Get-Date
 $operationObjects = @()
@@ -213,18 +220,18 @@ try {
         Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
-    Write-Information "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
+    Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
 } catch {
     throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
 }
 
-Write-Information "Starting parallel processing of $($AksResourceList.Count) AKS clusters"
+Write-Verbose "Starting parallel processing of $($AksResourceList.Count) AKS clusters"
 
 $functionsScript = $functions.ToString()
 
 $operationObjectsRaw = $AksResourceList | ForEach-Object -Parallel {
-    # Set InformationPreference in the parallel runspace so Write-Information logs appear
-    $InformationPreference = 'Continue'
+    # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
+    $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
     $functionBlock = [scriptblock]::Create($using:functionsScript)
@@ -243,19 +250,12 @@ $operationObjectsRaw = $AksResourceList | ForEach-Object -Parallel {
     }
 
     try {
-        # Authenticate and initialize modules in the parallel runspace
-        Connect-ToAzure -ClientId $using:UAMIClientId | Out-Null
-        Initialize-Modules | Out-Null
-
-        # Parse resource ID
+        # Parse resource ID first to get the subscription
         $info = ConvertFrom-ResourceIdAKS -ResourceId $rid
 
-        # Switch subscription context if needed
-        $currentSub = (Get-AzContext).Subscription.Id
-        if ($info.SubscriptionId -and $currentSub -ne $info.SubscriptionId) {
-            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-            Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
-        }
+        # Authenticate and initialize modules in the parallel runspace, passing the target subscription
+        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $info.SubscriptionId | Out-Null
+        Initialize-Modules | Out-Null
 
         # Execute the fault operation
         $faultResult = Invoke-AksZoneFault -ResourceGroup $info.ResourceGroup -ClusterName $info.ClusterName -DurationInMinutes $using:Duration
@@ -286,12 +286,12 @@ foreach ($item in $operationObjectsRaw) {
     }
     else {
         $unexpectedOutputs += $item
-        Write-Information "Captured unexpected output item of type '$($item.GetType().FullName)'." -InformationAction Continue
+        Write-Verbose "Captured unexpected output item of type '$($item.GetType().FullName)'."
     }
 }
 
 if ($unexpectedOutputs.Count -gt 0) {
-    Write-Information "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing." -InformationAction Continue
+    Write-Verbose "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing."
 }
 
 if ($operationObjects.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
@@ -354,6 +354,6 @@ if ($failureCount -gt 0) {
     throw $errorMsg
 }
 
-Write-Information "All AKS zone fault operations completed successfully." -InformationAction Continue
+Write-Verbose "All AKS zone fault operations completed successfully."
 
 #endregion

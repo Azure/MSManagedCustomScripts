@@ -106,10 +106,10 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Information $logEntry -InformationAction Continue }
+            "INFO"    { Write-Verbose $logEntry }
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Information $logEntry -InformationAction Continue }
+            "SUCCESS" { Write-Verbose $logEntry }
         }
     }
 
@@ -182,7 +182,9 @@ $functions = {
         [OutputType([bool])]
         param(
             [Parameter(Mandatory = $false)]
-            [string]$ClientId
+            [string]$ClientId,
+            [Parameter(Mandatory = $false)]
+            [string]$SubscriptionId
         )
         
         try {
@@ -192,6 +194,12 @@ $functions = {
             } else {
                 Write-Log "Authenticating to Azure using User-Assigned Managed Identity (ClientId: $ClientId)..." "INFO"
                 Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+            }
+
+            # If a subscription ID is provided, set the context to that subscription immediately
+            if (-not [string]::IsNullOrEmpty($SubscriptionId)) {
+                Write-Log "Setting subscription context to $SubscriptionId" "INFO"
+                Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             }
             
             $newContext = Get-AzContext -ErrorAction Stop
@@ -517,18 +525,18 @@ $functions = {
 }
 
 # region Main Script Execution
-# Set InformationPreference to Continue to see Write-Information logs in automation job streams.
-$InformationPreference = 'Continue'
+# Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
+$VerbosePreference = 'Continue'
 
-Write-Information "============================================================"
-Write-Information "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
-Write-Information "============================================================"
-Write-Information "Starting Azure app service zonal fault simulation..."
-Write-Information "Raw Input: $ResourceIds"
+Write-Verbose "============================================================"
+Write-Verbose "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
+Write-Verbose "============================================================"
+Write-Verbose "Starting Azure app service zonal fault simulation..."
+Write-Verbose "Raw Input: $ResourceIds"
 
 $appServiceIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if (-not $appServiceIds -or $appServiceIds.Count -eq 0) { throw "No valid app service resource IDs provided" }
-Write-Information "Parsed $($appServiceIds.Count) app service id(s)."
+Write-Verbose "Parsed $($appServiceIds.Count) app service id(s)."
 
 # Initial connection check in main thread
 try {
@@ -539,7 +547,7 @@ try {
         Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
-    Write-Information "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
+    Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
 }
 catch {
     throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
@@ -547,7 +555,7 @@ catch {
 
 $scriptStart = Get-Date
 
-Write-Information "Starting parallel processing of $($appServiceIds.Count) app services"
+Write-Verbose "Starting parallel processing of $($appServiceIds.Count) app services"
 
 . $functions
 $functionsScript = $functions.ToString()
@@ -559,8 +567,8 @@ Write-Log "Processing unique resource $uniqueAseIds" "INFO"
 
 #$resultsRaw = $uniqueAseIds | ForEach-Object -Parallel {
 foreach ($rid in $uniqueAseIds) {
-    # Set InformationPreference in the parallel runspace so Write-Information logs appear
-    $InformationPreference = 'Continue'
+    # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
+    $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
     $functionBlock = [scriptblock]::Create($functionsScript)
@@ -578,19 +586,13 @@ foreach ($rid in $uniqueAseIds) {
     }
 
     try {
-        # Authenticate and initialize modules in the parallel runspace
-        Connect-ToAzure -ClientId $UAMIClientId | Out-Null
-        
-        Write-Log "Processing resource $rid" "INFO"
-        
+        # Parse resource ID first to get the subscription
         $info = ConvertFrom-ResourceId -ResourceId $rid
         
-        # Switch subscription context if needed
-        $currentSub = (Get-AzContext).Subscription.Id
-        if ($info.SubscriptionId -and $currentSub -ne $info.SubscriptionId) {
-            Set-AzContext -SubscriptionId $info.SubscriptionId -ErrorAction Stop | Out-Null
-            Write-Log "Switched to subscription $($info.SubscriptionId) for resource $rid" "INFO"
-        }
+        Write-Log "Processing resource $rid" "INFO"
+
+        # Authenticate, passing the target subscription
+        Connect-ToAzure -ClientId $UAMIClientId -SubscriptionId $info.SubscriptionId | Out-Null
 
         $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $info.ResourceGroup -AppEnvName $info.AppEnvName -SubscriptionId $info.SubscriptionId
         $end = Get-Date
@@ -620,12 +622,12 @@ foreach ($item in $resultsRaw) {
     }
     else {
         $unexpectedOutputs += $item
-        Write-Information "Captured unexpected output item of type '$($item.GetType().FullName)'." -InformationAction Continue
+        Write-Verbose "Captured unexpected output item of type '$($item.GetType().FullName)'."
     }
 }
 
 if ($unexpectedOutputs.Count -gt 0) {
-    Write-Information "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing." -InformationAction Continue
+    Write-Verbose "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing."
 }
 
 if ($results.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
@@ -685,6 +687,6 @@ if ($failureCount -gt 0) {
     throw $errorMsg
 }
 
-Write-Information "All zone fault simulation on AppService operations completed successfully." -InformationAction Continue
+Write-Verbose "All zone fault simulation on AppService operations completed successfully."
 
 #endregion Main Script Execution
