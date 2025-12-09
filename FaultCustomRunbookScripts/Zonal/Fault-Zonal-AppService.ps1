@@ -106,10 +106,10 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Verbose $logEntry }
+            "INFO"    { Write-Verbose $logEntry -InformationAction Continue }
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Verbose $logEntry }
+            "SUCCESS" { Write-Verbose $logEntry -InformationAction Continue }
         }
     }
 
@@ -260,59 +260,6 @@ $functions = {
 
     <#
     .SYNOPSIS
-        Gets the environment Ids for the Azure App service resource IDs.
-
-    .DESCRIPTION
-        This function gets the app Service environment Ids.
-
-    .PARAMETER AppServiceResourceIds
-        The Azure app service resource IDs to process.
-
-    .OUTPUTS
-        Returns the list of ASE Ids.
-
-    .NOTES
-        Only supports Azure App service resource IDs.
-    #>
-    function Get-UniqueAppServiceEnvironmentIds {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)]
-            [string[]]$AppServiceResourceIds
-        )
-    
-        $aseIds = @()
-    
-        foreach ($rid in $AppServiceResourceIds) {
-            try {
-                Write-Log "Processing App service Resource Id $rid." "INFO"
-                # Parse resource ID to get resource group and app service name
-                if ($rid -match "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/sites/([^/]+)$") {
-                    $resourceGroup = $Matches[2]
-                    $appServiceName = $Matches[3]
-    
-                    $hostingEnvProfile = Get-AzWebApp -Name $appServiceName -ResourceGroupName $resourceGroup | Select-Object -ExpandProperty HostingEnvironmentProfile
-
-                    if ($hostingEnvProfile -and $hostingEnvProfile.Id) {
-                        Write-Log "Received App service environment Resource Id $($hostingEnvProfile.Id)" "INFO"
-                        $aseIds += $hostingEnvProfile.Id
-                    }
-                }
-                else {
-                    Write-Log "Invalid App Service resource ID format: $rid." "WARNING"
-                }
-            }
-            catch {              
-                Write-Log "Failed to get ASE ID for $rid $($_.Exception.Message)." "WARNING"
-            }
-        }
-    
-        Write-Log "Final App service environment Resource Id $aseIds" "INFO"
-        return $aseIds | Where-Object { $_ } | Select-Object -Unique
-    }
-
-    <#
-    .SYNOPSIS
         Performs a zonal fault on the app service.
 
     .DESCRIPTION
@@ -355,7 +302,7 @@ $functions = {
             Write-Log "Initiating zonal fault simulation on App server '$AppEnvName' in resource group '$ResourceGroupName'..." "INFO"
             
             $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
-            
+        
             if ($accessToken.Token -is [System.Security.SecureString]) {
                 $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($accessToken.Token)
                 try {
@@ -560,24 +507,19 @@ Write-Verbose "Starting parallel processing of $($appServiceIds.Count) app servi
 . $functions
 $functionsScript = $functions.ToString()
 
-Initialize-RequiredModules | Out-Null
-
-$uniqueAseIds = Get-UniqueAppServiceEnvironmentIds -AppServiceResourceIds $appServiceIds
-Write-Log "Processing unique resource $uniqueAseIds" "INFO"
-
-#$resultsRaw = $uniqueAseIds | ForEach-Object -Parallel {
-foreach ($rid in $uniqueAseIds) {
+# Process app service IDs in parallel - each runspace handles authentication, ASE lookup, and fault injection
+$resultsRaw = $appServiceIds | ForEach-Object -Parallel {
     # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
     $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
-    $functionBlock = [scriptblock]::Create($functionsScript)
+    $functionBlock = [scriptblock]::Create($using:functionsScript)
     . $functionBlock
     
-    #$rid = $_
+    $appServiceResourceId = $_
     $start = Get-Date
     $result = [pscustomobject]@{
-        ResourceId = $rid
+        ResourceId = $appServiceResourceId
         IsSuccess = $false
         ErrorMessage = $null
         StartTime = $start
@@ -586,15 +528,39 @@ foreach ($rid in $uniqueAseIds) {
     }
 
     try {
-        # Parse resource ID first to get the subscription
-        $info = ConvertFrom-ResourceId -ResourceId $rid
+        Write-Log "Processing App Service resource: $appServiceResourceId" "INFO"
         
-        Write-Log "Processing resource $rid" "INFO"
-
-        # Authenticate, passing the target subscription
-        Connect-ToAzure -ClientId $UAMIClientId -SubscriptionId $info.SubscriptionId | Out-Null
-
-        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $info.ResourceGroup -AppEnvName $info.AppEnvName -SubscriptionId $info.SubscriptionId
+        # Parse the App Service resource ID to get subscription, resource group, and app name
+        if ($appServiceResourceId -notmatch "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/sites/([^/]+)$") {
+            throw "Invalid App Service resource ID format: $appServiceResourceId"
+        }
+        
+        $subscriptionId = $Matches[1]
+        $resourceGroup = $Matches[2]
+        $appServiceName = $Matches[3]
+        
+        # Authenticate and set subscription context in one call
+        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $subscriptionId | Out-Null
+        
+        # Initialize required modules
+        Initialize-RequiredModules | Out-Null
+        
+        # Get the ASE ID from the App Service
+        Write-Log "Getting ASE ID for App Service '$appServiceName' in resource group '$resourceGroup'" "INFO"
+        $hostingEnvProfile = Get-AzWebApp -Name $appServiceName -ResourceGroupName $resourceGroup -ErrorAction Stop | Select-Object -ExpandProperty HostingEnvironmentProfile
+        
+        if (-not $hostingEnvProfile -or -not $hostingEnvProfile.Id) {
+            throw "App Service '$appServiceName' is not hosted on an App Service Environment (ASE). Zonal fault simulation is only supported for ASE-hosted apps."
+        }
+        
+        $aseResourceId = $hostingEnvProfile.Id
+        Write-Log "Found ASE resource ID: $aseResourceId" "INFO"
+        
+        # Parse the ASE resource ID
+        $aseInfo = ConvertFrom-ResourceId -ResourceId $aseResourceId
+        
+        # Execute the zonal fault simulation
+        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
@@ -608,11 +574,12 @@ foreach ($rid in $uniqueAseIds) {
         $result.Status = 'Failed'
     }
 
-    $resultsRaw += $result
     return $result
 }
 
+# Ensure resultsRaw is an array
 $resultsRaw = @($resultsRaw | Where-Object { $_ })
+
 $results = @()
 $unexpectedOutputs = @()
 
