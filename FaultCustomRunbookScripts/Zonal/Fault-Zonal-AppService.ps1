@@ -52,8 +52,8 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$ResourceIds,
 
-    [Parameter(Mandatory = $false, HelpMessage="Zone on which fault will get induced.")]
-    [string]$TargetZone = "1",
+    [Parameter(Mandatory = $true, HelpMessage="Zone on which fault will get induced.")]
+    [string]$TargetZone,
 
     [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
     [ValidateNotNullOrEmpty()]
@@ -331,7 +331,7 @@ $functions = {
             $apiVersion = "2023-12-01"
             $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/hostingEnvironments/$AppEnvName/startFaultSimulation?api-version=$apiVersion"
 
-            Write-Log "Calling App Service zonal fault simulation REST API endpoint..." "INFO"
+            Write-Log "Calling App Service zonal fault simulation REST API endpoint... $body " "INFO"
 
             $headers = @{
                 'Authorization' = "Bearer $token"

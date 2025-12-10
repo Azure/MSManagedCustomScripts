@@ -149,6 +149,23 @@ $functions = {
                 return [pscustomobject]@{ IsSuccess = $false; Status = 'Skipped'; Message = 'No zoned node pools found.' }
             }
 
+            # Filter out system node pools - they cannot be scaled to 0 nodes
+            $systemPools = $zonedPools | Where-Object { $_.Mode -eq 'System' }
+            $userPools = $zonedPools | Where-Object { $_.Mode -ne 'System' }
+            
+            if ($systemPools) {
+                $systemPoolNames = ($systemPools | ForEach-Object { $_.Name }) -join ', '
+                Write-Log "Skipping system node pool(s) '$systemPoolNames' - system pools cannot be scaled to 0 nodes." "WARNING"
+            }
+            
+            if (-not $userPools) {
+                Write-Log "No user node pools available to fault for cluster '$ClusterName' (only system pools found which cannot be scaled to 0)." "WARNING"
+                return [pscustomobject]@{ IsSuccess = $false; Status = 'Skipped'; Message = 'No user node pools available to fault. System pools cannot be scaled to 0.' }
+            }
+            
+            # Use only user pools for faulting
+            $zonedPools = $userPools
+
             # Record original counts and autoscale settings, then scale down
             $originalSettings = @{}
             foreach ($np in $zonedPools) {
@@ -258,7 +275,7 @@ $operationObjectsRaw = $AksResourceList | ForEach-Object -Parallel {
         Initialize-Modules | Out-Null
 
         # Execute the fault operation
-        $faultResult = Invoke-AksZoneFault -ResourceGroup $info.ResourceGroup -ClusterName $info.ClusterName -DurationInMinutes $using:Duration
+        $faultResult = Invoke-AksZoneFault -ResourceGroup $info.ResourceGroup -ClusterName $info.ClusterName -DurationInMinutes $using:Duration -TargetZone $using:TargetZone
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
