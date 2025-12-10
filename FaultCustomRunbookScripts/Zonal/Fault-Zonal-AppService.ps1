@@ -295,7 +295,10 @@ $functions = {
             [string]$AppEnvName,
             
             [Parameter(Mandatory = $false)]
-            [string]$SubscriptionId
+            [string]$SubscriptionId,
+
+            [Parameter(Mandatory = $false)]
+            [string]$TargetZone
         )
         
         try {
@@ -560,7 +563,7 @@ $resultsRaw = $appServiceIds | ForEach-Object -Parallel {
         $aseInfo = ConvertFrom-ResourceId -ResourceId $aseResourceId
         
         # Execute the zonal fault simulation
-        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId
+        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId -TargetZone $using:TargetZone
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
