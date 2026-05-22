@@ -143,10 +143,10 @@ function Get-ResourceTargets {
     }
     else {
         # Fallback path: single TargetZone applied to all resources.
-        if ([string]::IsNullOrWhiteSpace($TargetZone)) {
-            throw "Either SubscriptionToTargetZone or TargetZone must be supplied."
-        }
-        $sharedZone = $TargetZone.Trim()
+        # Empty/missing TargetZone is allowed (legacy contract) and propagates as an empty zone
+        # string. Downstream zone-aware fault routines treat empty as "no zone targeting" (act on
+        # the whole resource / all zoned backends); zone-agnostic routines ignore it.
+        $sharedZone = if ([string]::IsNullOrWhiteSpace($TargetZone)) { '' } else { $TargetZone.Trim() }
         foreach ($rid in $resourceIdList) {
             if ($rid -notmatch '/subscriptions/([^/]+)/') {
                 throw "Invalid resource id '$rid'. Could not extract subscription id."
@@ -445,7 +445,11 @@ $functions = {
         )
         
         try {
-            Write-Log "Initiating zonal fault simulation on App server '$AppEnvName' in resource group '$ResourceGroupName'..." "INFO"
+            if ([string]::IsNullOrWhiteSpace($TargetZone)) {
+                throw "TargetZone is required for App Service zonal fault simulation; supply TargetZone or a non-empty value for the subscription in SubscriptionToTargetZone."
+            }
+
+            Write-Log "Initiating zonal fault simulation on App server '$AppEnvName' in resource group '$ResourceGroupName' (zone '$TargetZone')..." "INFO"
             
             $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
         
