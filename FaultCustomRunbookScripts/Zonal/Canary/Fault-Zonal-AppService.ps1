@@ -1,23 +1,22 @@
 <#
 .SYNOPSIS
-    Performs unplanned restart with failover for Azure PostgreSQL Flexible Servers in an Azure Runbook.
+    Injects zonal fault for an app service in an Azure Runbook.
 
 .DESCRIPTION
-    This Azure Runbook script triggers an unplanned restart with failover for one or more Azure PostgreSQL Flexible Servers.
-    It accepts a comma-separated list of resource IDs as input and performs forced failover operations on each server.
-    The script includes detailed logging and error handling optimized for Azure Automation.
+    This Azure Runbook script triggers a zonal fault simulation by using a ARM api.
     
     This script is designed to simulate planned/unplanned outages for resilience testing purposes.
     It performs the following operations:
     1. Authenticates to Azure using Managed Identity
     2. Validates and imports required PowerShell modules
-    3. Parses the provided PostgreSQL server resource IDs
-    4. Executes a forced failover restart on each target server
-    5. Provides comprehensive logging throughout the process
+    3. Parses the provided app service resource ID
+	  4. Gets the app service environmet ID from the app service resource ID.
+    5. Executes the zonal fault simulation on the ASE.
+    6. Provides comprehensive logging throughout the process
 
 .PARAMETER ResourceIds
-    Comma-separated PostgreSQL Flexible Server resource IDs. Each resource id should be in the format:
-    "/subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{server-name}"
+    Comma-separated App Service resource IDs. Each resource id should be in the format:
+    "/subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.Web/sites/{appservice-name}"
 
 .PARAMETER SubscriptionToTargetZone
     JSON-serialized dictionary mapping each involved subscription id to the logical availability zone to fault.
@@ -30,12 +29,12 @@
 
 #>
 
-#Requires -Modules Az.PostgreSQL, Az.Accounts
+#Requires -Modules Az.Websites, Az.Accounts
 #Requires -Version 7.0
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Comma-separated PostgreSQL Flexible Server resource IDs.")]
+    [Parameter(Mandatory = $true, HelpMessage = "Comma-separated App Service resource IDs.")]
     [ValidateNotNullOrEmpty()]
     [string]$ResourceIds,
 
@@ -45,12 +44,12 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "Fallback logical availability zone applied to every resource when SubscriptionToTargetZone is not supplied. Ignored when SubscriptionToTargetZone is provided.")]
     [string]$TargetZone,
 
-    [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
-    [string]$UAMIClientId,
-
     [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
     [ValidateNotNullOrEmpty()]
-    [long]$Duration
+    [long]$Duration,
+
+    [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
+    [string]$UAMIClientId
 )
 
 function Get-ResourceTargets {
@@ -203,20 +202,20 @@ $functions = {
         $logEntry = "[$timestamp] [$Level] $Message"
         
         switch ($Level) {
-            "INFO"    { Write-Verbose $logEntry }
+            "INFO"    { Write-Verbose $logEntry}
             "WARNING" { Write-Warning $logEntry }
             "ERROR"   { Write-Error $logEntry }
-            "SUCCESS" { Write-Verbose $logEntry }
+            "SUCCESS" { Write-Verbose $logEntry}
         }
     }
 
     <#
     .SYNOPSIS
-        Converts an Azure PostgreSQL Flexible Server resource ID into its components.
+        Converts an Azure App service resource ID into its components.
 
     .DESCRIPTION
-        This function extracts subscription ID, resource group name, and server name
-        from a properly formatted Azure PostgreSQL Flexible Server resource ID.
+        This function extracts subscription ID, resource group name, and app service environment name
+        from a properly formatted Azure App service resource ID.
         It validates the format and throws an error if the format is invalid.
 
     .PARAMETER ResourceId
@@ -226,33 +225,30 @@ $functions = {
         Returns a hashtable containing:
         - SubscriptionId: The Azure subscription ID
         - ResourceGroup: The resource group name
-        - ServerName: The PostgreSQL server name
+        - AppEnvName: The app service environment name
 
     .EXAMPLE
-        $resourceInfo = ConvertFrom-ResourceId -ResourceId "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/myRG/providers/Microsoft.DBforPostgreSQL/flexibleServers/myserver"
-        # Returns: @{SubscriptionId="12345678-1234-1234-1234-123456789012"; ResourceGroup="myRG"; ServerName="myserver"}
+        $resourceInfo = ConvertFrom-ResourceId -ResourceId "/subscriptions/2427679b-6638-48e5-8774-6096cd849451/resourceGroups/rabiswaldrillrg/providers/Microsoft.Web/hostingEnvironments/rbdrillasewebapp1"
+        # Returns: @{SubscriptionId="2427679b-6638-48e5-8774-6096cd849451"; ResourceGroup="rabiswaldrillrg"; AppEnvName="rbdrillasewebapp1"}
 
     .NOTES
-        Only supports Azure PostgreSQL Flexible Server resource IDs.
-        Single Server format is not supported.
+        Only supports Azure App service resource IDs.
     #>
     function ConvertFrom-ResourceId {
         [CmdletBinding()]
         param (
             [Parameter(Mandatory = $true)]
-            [ValidateNotNullOrEmpty()]
             [string]$ResourceId
         )
         
-        if ($ResourceId -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.DBforPostgreSQL/flexibleServers/([^/]+)") {
+        if ($ResourceId -match "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/hostingEnvironments/([^/]+)$") {
             return @{
                 SubscriptionId = $Matches[1]
                 ResourceGroup = $Matches[2]
-                ServerName = $Matches[3]
+                AppEnvName = $Matches[3]
             }
-        }
-        else {
-            throw "Invalid resource ID format. Expected format: /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{server-name}"
+        } else {
+            throw "Invalid App service resource ID format. Expected format: /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.Web/hostingEnvironments/{appservice-name}"
         }
     }
 
@@ -270,7 +266,7 @@ $functions = {
 
     .EXAMPLE
         if (Connect-ToAzure) {
-            Write-Log "Azure authentication successful"
+            Write-Log "Authentication successful" "SUCCESS"
         }
 
     .NOTES
@@ -281,17 +277,18 @@ $functions = {
         [CmdletBinding()]
         [OutputType([bool])]
         param(
+            [Parameter(Mandatory = $false)]
             [string]$ClientId,
+            [Parameter(Mandatory = $false)]
             [string]$SubscriptionId
         )
         
         try {
             if ([string]::IsNullOrEmpty($ClientId)) {
-                Write-Log "Authenticating to Azure via System-Assigned Managed Identity" "INFO"
+                Write-Log "Authenticating to Azure using System-Assigned Managed Identity..." "INFO"
                 Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
-            } 
-            else {
-                Write-Log "Authenticating to Azure via User-Assigned Managed Identity (ClientId: $ClientId)" "INFO"
+            } else {
+                Write-Log "Authenticating to Azure using User-Assigned Managed Identity (ClientId: $ClientId)..." "INFO"
                 Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
             }
 
@@ -301,35 +298,35 @@ $functions = {
                 Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             }
             
-            $context = Get-AzContext -ErrorAction Stop
-            Write-Log "Successfully connected to Azure as $($context.Account.Id) in subscription: $($context.Subscription.Name)" "SUCCESS"
+            $newContext = Get-AzContext -ErrorAction Stop
+            Write-Log "Successfully authenticated as $($newContext.Account.Id) on subscription $($newContext.Subscription.Name)" "SUCCESS"
             return $true
         }
         catch {
-            Write-Log "Failed to authenticate to Azure: $($_.Exception.Message)" "ERROR"
+            Write-Log "Azure authentication failed: $($_.Exception.Message)" "ERROR"
             throw "Azure authentication failed: $($_.Exception.Message)"
         }
     }
 
     <#
     .SYNOPSIS
-        Validates and imports required PowerShell modules for PostgreSQL operations.
+        Validates and imports required PowerShell modules for app service operations.
 
     .DESCRIPTION
-        This function checks for the availability of the Az.PostgreSQL module and imports it
-        if it's available but not currently loaded. This is essential for PostgreSQL Flexible
-        Server operations in Azure Automation environments.
+        This function checks for the availability of the Az.Websites module and imports it
+        if it's available but not currently loaded. This is essential for app service
+        operations in Azure Automation environments.
 
     .OUTPUTS
         Returns $true if the module is available and loaded, $false otherwise.
 
     .EXAMPLE
         if (Initialize-RequiredModules) {
-            Write-Log "All required modules are available"
+            Write-Log "Modules ready" "SUCCESS"
         }
 
     .NOTES
-        The Az.PostgreSQL module must be imported into the Azure Automation Account
+        The Az.Websites module must be imported into the Azure Automation Account
         before this function can succeed.
     #>
     function Initialize-RequiredModules {
@@ -338,17 +335,17 @@ $functions = {
         param()
         
         try {
-            Write-Log "Checking for required Az.PostgreSQL module..." "INFO"
-            if (-not (Get-Module -Name Az.PostgreSQL -ListAvailable)) {
-                throw "Az.PostgreSQL module is not available in this Automation Account"
+            Write-Log "Checking for required Az.Websites module..." "INFO"
+            if (-not (Get-Module -Name "Az.Websites" -ListAvailable)) {
+                throw "Az.Websites module is not available in this Automation Account"
             }
             
-            if (-not (Get-Module -Name Az.PostgreSQL)) {
-                Write-Log "Az.PostgreSQL module found but not loaded. Importing module..." "INFO"
-                Import-Module Az.PostgreSQL -ErrorAction Stop -Force
+            if (-not (Get-Module -Name "Az.Websites")) {
+                Write-Log "Importing Az.Websites module..." "INFO"
+                Import-Module Az.Websites -ErrorAction Stop -Force
             }
             
-            Write-Log "Az.PostgreSQL module is ready" "SUCCESS"
+            Write-Log "Az.Websites module is ready" "SUCCESS"
             return $true
         }
         catch {
@@ -359,18 +356,16 @@ $functions = {
 
     <#
     .SYNOPSIS
-        Performs an unplanned restart with failover on an Azure PostgreSQL Flexible Server.
+        Performs a zonal fault on the app service.
 
     .DESCRIPTION
-        This function executes a forced failover restart operation on the specified PostgreSQL
-        Flexible Server. It handles subscription context switching if needed and provides
-        detailed logging throughout the process.
+        This function executes a zonal fault simulation on the app service.
 
     .PARAMETER ResourceGroupName
-        The name of the resource group containing the PostgreSQL server.
+        The name of the resource group containing the app service.
 
-    .PARAMETER ServerName
-        The name of the PostgreSQL Flexible Server to restart.
+    .PARAMETER AppEnvName
+        The name of the app service environment to simulate the fault on.
 
     .PARAMETER SubscriptionId
         The Azure subscription ID. If provided and different from current context, 
@@ -380,100 +375,251 @@ $functions = {
         Returns $true if the restart operation is successful, $false otherwise.
 
     .EXAMPLE
-        $success = Restart-PostgreSQLServerWithFailover -ResourceGroupName "myRG" -ServerName "myserver" -SubscriptionId "12345678-1234-1234-1234-123456789012"
+        $success = Invoke-AppServiceZonalFault -ResourceGroupName "myRG" -AppEnvName "myAppEnv" -SubscriptionId "12345678-1234-1234-1234-123456789012"
 
     .NOTES
-        This operation will cause temporary unavailability of the PostgreSQL server.
-        Use with caution, especially in production environments.
-        The operation uses ForcedFailover mode for immediate effect.
+        This operation will simulate a zonal fault on the appservice. App service won't go down.'
     #>
-    function Restart-PostgreSQLServerWithFailover {
+    function Invoke-AppServiceZonalFault {
         [CmdletBinding()]
         [OutputType([pscustomobject])]
         param (
             [Parameter(Mandatory = $true)]
-            [ValidateNotNullOrEmpty()]
             [string]$ResourceGroupName,
             
             [Parameter(Mandatory = $true)]
-            [ValidateNotNullOrEmpty()]
-            [string]$ServerName,
+            [string]$AppEnvName,
             
             [Parameter(Mandatory = $false)]
-            [string]$SubscriptionId
+            [string]$SubscriptionId,
+
+            [Parameter(Mandatory = $false)]
+            [string]$TargetZone
         )
         
         try {
-            Write-Log "Initiating unplanned restart with failover for server '$ServerName' in resource group '$ResourceGroupName'..." "INFO"
+            Write-Log "Initiating zonal fault simulation on App server '$AppEnvName' in resource group '$ResourceGroupName'..." "INFO"
             
-            Restart-AzPostgreSqlFlexibleServer `
-                -ResourceGroupName $ResourceGroupName `
-                -Name $ServerName `
-                -RestartWithFailover `
-                -FailoverMode ForcedFailover `
-                -ErrorAction Stop
-                
-            Write-Log "Successfully initiated failover for server '$ServerName'" "SUCCESS"
-            return [pscustomobject]@{ IsSuccess = $true; Status = 'Succeeded'; Message = "Restart with failover initiated successfully" }
+            $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
+        
+            if ($accessToken.Token -is [System.Security.SecureString]) {
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($accessToken.Token)
+                try {
+                    $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+                }
+                finally {
+                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                }
+            } else {
+                $token = $accessToken.Token
+            }
+
+            $expirationTime = (Get-Date).AddMinutes(5).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+            $body = @{
+                properties = @{
+                    faultKind = "Zone"
+                    zoneFaultSimulationParameters = @{
+                        zones = @($TargetZone)
+                    }
+                    faultSimulationConstraints = @{
+                        expirationTime = $expirationTime
+                    }
+                }
+            } | ConvertTo-Json -Depth 5
+            
+            $apiVersion = "2023-12-01"
+            $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/hostingEnvironments/$AppEnvName/startFaultSimulation?api-version=$apiVersion"
+
+            Write-Log "Calling App Service zonal fault simulation REST API endpoint... $body " "INFO"
+
+            $headers = @{
+                'Authorization' = "Bearer $token"
+                'Content-Type' = 'application/json'
+            }
+            
+            $response = Invoke-WebRequest -Uri $uri -Method POST -Headers $headers -Body $body -UseBasicParsing -ErrorAction Stop
+            
+            Write-Log "API Response Status Code: $($response.StatusCode)" "INFO"
+            
+            if ($response.StatusCode -in (200, 202)) {
+                Write-Log "Successfully initiated zonal fault on App environment '$AppEnvName' (HTTP $($response.StatusCode))" "INFO"
+            }
+            else {
+                throw "Unexpected status code $($response.StatusCode) from fault simulation API. Response: $($response.Content)"
+            }
+
+            $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/hostingEnvironments/$AppEnvName/listFaultSimulation?api-version=$apiVersion"
+            $response = Invoke-WebRequest -Uri $uri -Method POST -Headers $headers -UseBasicParsing -ErrorAction Stop
+
+            if ($response.StatusCode -in (200)) {
+                Write-Log "Received the current list of zonal fault on App environment '$AppEnvName' (HTTP $($response.StatusCode))" "INFO"
+                $inProgressId = Get-InProgressOperationIds -ResponseBody $response.Content
+            }
+            else {
+                throw "Unexpected status code $($response.StatusCode) from list fault simulation API. Response: $($response.Content)"
+            }
+
+            $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/hostingEnvironments/$AppEnvName/getFaultSimulation?api-version=$apiVersion"
+            
+            $completed = Wait-ForFaultSimulationCompletion -StatusUri $uri -Headers $headers -InProgressId $inProgressId
+            
+            if ($completed) {
+                Write-Log "Zonal fault simulation for '$AppEnvName' completed successfully." "SUCCESS"
+                return [pscustomobject]@{ IsSuccess = $true; Status = 'Succeeded'; Message = "Zonal fault simulation for '$AppEnvName' completed successfully." }
+            }
+            else {
+                # Prepare the JSON body with the in-progress simulation ID
+                $body = @{
+                    properties = @{
+                        simulationId = $inProgressId
+                    }
+                } | ConvertTo-Json -Depth 3
+
+                $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/hostingEnvironments/$AppEnvName/stopFaultSimulation?api-version=$apiVersion"
+                Invoke-WebRequest -Uri $uri -Method POST -Headers $headers -Body $body -UseBasicParsing -ErrorAction Stop
+                Write-Log "Time limit reached or failure observed, Zonal fault simulation for '$AppEnvName' has been stopped." "INFO"
+            }
         }
         catch {
-            $errorMessage = "Failed to restart server '$ServerName' with failover: $($_.Exception.Message)"
+            $errorMessage = "Failed to simulate zonal fault on App environment '$AppEnvName': $($_.Exception.Message)"
             Write-Log $errorMessage "ERROR"
             return [pscustomobject]@{ IsSuccess = $false; Status = 'Failed'; Message = $errorMessage }
         }
     }
 
+    function Get-InProgressOperationIds {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [string]$ResponseBody
+        )
+    
+        $operationIds = @()
+        try {
+            $operations = $ResponseBody | ConvertFrom-Json
+            foreach ($item in $operations) {
+                if ($item.operation.status -eq 'InProgress') {
+                    return $item.operation.id
+                }
+            }
+        } 
+        catch {
+            Write-Log "Failed to parse response or extract operation IDs: $($_.Exception.Message)." "WARNING"
+        }
+        return $operationIds
+    }
+
+    function Wait-ForFaultSimulationCompletion {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [string]$StatusUri,
+            [Parameter(Mandatory = $true)]
+            [hashtable]$Headers,
+            [Parameter(Mandatory = $true)]
+            [string]$InProgressId,
+            [Parameter(Mandatory = $false)]
+            [int]$TimeoutSeconds = 1200, # 20 minutes
+            [Parameter(Mandatory = $false)]
+            [int]$PollIntervalSeconds = 30
+        )
+    
+        $startTime = Get-Date
+        while ($true) {
+            try {
+                # Prepare the JSON body with the in-progress simulation ID
+                $body = @{
+                    properties = @{
+                        simulationId = $InProgressId
+                    }
+                } | ConvertTo-Json -Depth 3
+
+                $response = Invoke-WebRequest -Uri $StatusUri -Method POST -Headers $Headers -Body $body -UseBasicParsing -ErrorAction Stop
+
+                if ($response.StatusCode -eq 200) {
+                    $body = $response.Content | ConvertFrom-Json
+                    $status = $body.operation.status
+                    Write-Log "Current fault simulation status: $status" "INFO"
+                    if ($status -eq 'Succeeded') {
+                        Write-Log "Fault simulation operation succeeded." "SUCCESS"
+                        return $true
+                    }
+                    elseif ($status -ne 'InProgress') {
+                        Write-Log "Fault simulation operation status: $status (not InProgress/Succeeded)" "WARNING"
+                        return $false
+                    }
+                }
+                else {
+                    Write-Log "Unexpected status code $($response.StatusCode) from fault simulation status API." "WARNING"
+                }
+            }
+            catch {
+                Write-Log "Error polling fault simulation status: $($_.Exception.Message)" "ERROR"
+            }
+    
+            $elapsed = (Get-Date) - $startTime
+            if ($elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                Write-Log "Timeout reached (20 minutes) while waiting for fault simulation completion." "WARNING"
+                break
+            }
+            Start-Sleep -Seconds $PollIntervalSeconds
+        }
+        return $false
+    }
+
     #endregion Functions
 }
 
-#region Main Script Execution
+# region Main Script Execution
 # Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
 $VerbosePreference = 'Continue'
 
 Write-Verbose "============================================================"
-Write-Verbose "AZURE POSTGRESQL FLEXIBLE SERVER FAILOVER SCRIPT"
+Write-Verbose "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
 Write-Verbose "============================================================"
-Write-Verbose "Starting PostgreSQL Flexible Server Failover operation..."
+Write-Verbose "Starting Azure app service zonal fault simulation..."
 Write-Verbose "Raw Input: ResourceIds=$ResourceIds; SubscriptionToTargetZone=$SubscriptionToTargetZone; TargetZone=$TargetZone"
 
-$pgTargets = Get-ResourceTargets -ResourceIds $ResourceIds -SubscriptionToTargetZone $SubscriptionToTargetZone -TargetZone $TargetZone
-Write-Verbose "Parsed $($pgTargets.Count) PostgreSQL server target(s)."
-
-$scriptStart = Get-Date
-$opResults = @()
+$appServiceTargets = Get-ResourceTargets -ResourceIds $ResourceIds -SubscriptionToTargetZone $SubscriptionToTargetZone -TargetZone $TargetZone
+Write-Verbose "Parsed $($appServiceTargets.Count) app service target(s)."
 
 # Initial connection check in main thread
 try {
-    Write-Verbose "Authenticating to Azure..."
     if ($UAMIClientId) {
         Connect-AzAccount -Identity -AccountId $UAMIClientId -ErrorAction Stop | Out-Null
-    } else {
+    }
+    else {
         Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
     Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
-} catch {
+}
+catch {
     throw "Initial Azure authentication failed. Please check Managed Identity configuration. Error: $($_.Exception.Message)"
 }
 
-Write-Verbose "Starting parallel processing of $($pgTargets.Count) PostgreSQL servers."
+$scriptStart = Get-Date
 
+Write-Verbose "Starting parallel processing of $($appServiceTargets.Count) app services"
+
+. $functions
 $functionsScript = $functions.ToString()
 
-$opResultsRaw = $pgTargets | ForEach-Object -Parallel {
+# Process app service targets in parallel - each runspace handles authentication, ASE lookup, and fault injection
+$resultsRaw = $appServiceTargets | ForEach-Object -Parallel {
     # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
     $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
     $functionBlock = [scriptblock]::Create($using:functionsScript)
     . $functionBlock
-
+    
     $entry = $_
-    $rid = $entry.ResourceId
+    $appServiceResourceId = $entry.ResourceId
     $targetZone = $entry.TargetZone
     $start = Get-Date
     $result = [pscustomobject]@{
-        ResourceId = $rid
+        ResourceId = $appServiceResourceId
         IsSuccess = $false
         ErrorMessage = $null
         StartTime = $start
@@ -483,14 +629,39 @@ $opResultsRaw = $pgTargets | ForEach-Object -Parallel {
 
 
     try {
-        # Parse resource ID first to get the subscription
-        $info = ConvertFrom-ResourceId -ResourceId $rid
-
-        # Authenticate and initialize modules in the parallel runspace, passing the target subscription
-        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $info.SubscriptionId | Out-Null
+        Write-Log "Processing App Service resource: $appServiceResourceId" "INFO"
+        
+        # Parse the App Service resource ID to get subscription, resource group, and app name
+        if ($appServiceResourceId -notmatch "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Web/sites/([^/]+)$") {
+            throw "Invalid App Service resource ID format: $appServiceResourceId"
+        }
+        
+        $subscriptionId = $Matches[1]
+        $resourceGroup = $Matches[2]
+        $appServiceName = $Matches[3]
+        
+        # Authenticate and set subscription context in one call
+        Connect-ToAzure -ClientId $using:UAMIClientId -SubscriptionId $subscriptionId | Out-Null
+        
+        # Initialize required modules
         Initialize-RequiredModules | Out-Null
-
-        $faultResult = Restart-PostgreSQLServerWithFailover -ResourceGroupName $info.ResourceGroup -ServerName $info.ServerName -SubscriptionId $info.SubscriptionId
+        
+        # Get the ASE ID from the App Service
+        Write-Log "Getting ASE ID for App Service '$appServiceName' in resource group '$resourceGroup'" "INFO"
+        $hostingEnvProfile = Get-AzWebApp -Name $appServiceName -ResourceGroupName $resourceGroup -ErrorAction Stop | Select-Object -ExpandProperty HostingEnvironmentProfile
+        
+        if (-not $hostingEnvProfile -or -not $hostingEnvProfile.Id) {
+            throw "App Service '$appServiceName' is not hosted on an App Service Environment (ASE). Zonal fault simulation is only supported for ASE-hosted apps."
+        }
+        
+        $aseResourceId = $hostingEnvProfile.Id
+        Write-Log "Found ASE resource ID: $aseResourceId" "INFO"
+        
+        # Parse the ASE resource ID
+        $aseInfo = ConvertFrom-ResourceId -ResourceId $aseResourceId
+        
+        # Execute the zonal fault simulation
+        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId -TargetZone $targetZone
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
@@ -498,21 +669,24 @@ $opResultsRaw = $pgTargets | ForEach-Object -Parallel {
         $result.EndTime = $end
         $result.Status = $faultResult.Status
     }
-    catch {
+    catch { 
         $result.EndTime = Get-Date
         $result.ErrorMessage = $_.Exception.Message
         $result.Status = 'Failed'
     }
+
     return $result
 }
 
-$opResultsRaw = @($opResultsRaw | Where-Object { $_ })
-$opResults = @()
+# Ensure resultsRaw is an array
+$resultsRaw = @($resultsRaw | Where-Object { $_ })
+
+$results = @()
 $unexpectedOutputs = @()
 
-foreach ($item in $opResultsRaw) {
+foreach ($item in $resultsRaw) {
     if ($item -is [pscustomobject] -and $item.PSObject.Properties['ResourceId']) {
-        $opResults += $item
+        $results += $item
     }
     else {
         $unexpectedOutputs += $item
@@ -524,19 +698,18 @@ if ($unexpectedOutputs.Count -gt 0) {
     Write-Verbose "Skipping $($unexpectedOutputs.Count) unexpected output item(s) from parallel processing."
 }
 
-if ($opResults.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
+if ($results.Count -eq 0 -and $unexpectedOutputs.Count -gt 0) {
     Write-Warning "Parallel processing returned no valid result objects. Check unexpected outputs for details."
 }
 
-
 $scriptEnd = Get-Date
-$successCount = ($opResults | Where-Object { $_.IsSuccess }).Count
-$failureCount = ($opResults | Where-Object { -not $_.IsSuccess }).Count
+$successCount = ($results | Where-Object { $_.IsSuccess }).Count
+$failureCount = ($results | Where-Object { -not $_.IsSuccess }).Count
 $failureCount += $unexpectedOutputs.Count
 $overallStatus = if ($failureCount -eq 0) { 'Success' } elseif ($successCount -gt 0) { 'PartialSuccess' } else { 'Failed' }
 
 $resourceResults = @()
-foreach ($r in $opResults) {
+foreach ($r in $results) {
     if (-not $r) { continue }
     $endTime = if ($r.EndTime) { $r.EndTime } elseif ($r.StartTime) { $r.StartTime } else { Get-Date }
     $startTime = if ($r.StartTime) { $r.StartTime } else { $endTime }
@@ -563,17 +736,25 @@ foreach ($unexpected in $unexpectedOutputs) {
     $resourceResults += @{ ResourceId = $null; IsSuccess = $null; Error = @{ ErrorCode = 'UnexpectedOutput'; Message = if ($details) { $details } else { $unexpected.ToString() }; Details = $details; Category = $null; IsRetryable = $false }; ProcessedAt = (Get-Date).ToUniversalTime(); ProcessingDurationMs = 0; Metadata = @{ Status = $null } }
 }
 
-$executionResult = [ordered]@{ Status=$overallStatus; ResourceResults=$resourceResults; SuccessCount=$successCount; FailureCount=$failureCount; ExecutionStartTime=$scriptStart.ToUniversalTime(); ExecutionEndTime=$scriptEnd.ToUniversalTime(); GlobalError= if ($overallStatus -eq 'Failed') { 'All PostgreSQL failover operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some failover operations failed.' } else { $null } }
+$executionResult = [ordered]@{
+    Status=$overallStatus
+    ResourceResults=$resourceResults
+    SuccessCount=$successCount
+    FailureCount=$failureCount
+    ExecutionStartTime=$scriptStart.ToUniversalTime()
+    ExecutionEndTime=$scriptEnd.ToUniversalTime()
+    GlobalError= if ($overallStatus -eq 'Failed') { 'All zone fault simulation on AppService operations failed.' } elseif ($overallStatus -eq 'PartialSuccess') { 'Some operations failed.' } else { $null }
+}
 $executionJson = $executionResult | ConvertTo-Json -Depth 6
 Write-Output $executionJson
 
 # Fail the runbook if any resource could not be faulted
 if ($failureCount -gt 0) {
-    $errorMsg = "Runbook failed: $failureCount out of $($pgTargets.Count) PostgreSQL server(s) could not be faulted. Status: $overallStatus"
+    $errorMsg = "Runbook failed: $failureCount out of $($appServiceTargets.Count) AppService(s) could not be faulted. Status: $overallStatus"
     Write-Error $errorMsg -ErrorAction Stop
     throw $errorMsg
 }
 
-Write-Verbose "All PostgreSQL server failover operations completed successfully."
+Write-Verbose "All zone fault simulation on AppService operations completed successfully."
 
 #endregion Main Script Execution
