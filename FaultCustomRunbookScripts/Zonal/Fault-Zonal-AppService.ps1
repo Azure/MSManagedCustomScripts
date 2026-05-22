@@ -14,33 +14,19 @@
     5. Executes the zonal fault simulation on the ASE.
     6. Provides comprehensive logging throughout the process
 
-.PARAMETER ResourceId
-    The resource ID for the Azure app service for which zonal fault simulated.
-    The resource ID should be in the format:
+.PARAMETER ResourceIds
+    Comma-separated App Service resource IDs. Each resource id should be in the format:
     "/subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.Web/sites/{appservice-name}"
 
-.EXAMPLE
-    # Example 1: Direct execution with resource ID
-    .\Fault-Zonal-AppService.ps1 -ResourceId "/subscriptions/2427679b-6638-48e5-8774-6096cd849451/resourceGroups/rabiswaldrillrg/providers/Microsoft.Web/sites/rbdrillasewebapp1"
-    
-.NOTES
-    Author: Azure DevOps Team
-    Date: 2025-10-05
-    Version: 1.0
-    
-    Prerequisites:
-    - Runbook must run with appropriate permissions (Virtual Machine Contributor role on target app service)
-    - Managed Identity or Run As Account must be configured for the Automation Account
-    - Target app service must be in a running state
-    
-    Security Considerations:
-    - This script performs destructive operations and should only be used in controlled environments
-    - Ensure proper RBAC permissions are in place
-    - Consider implementing approval workflows for production environments
-    
-    Logging:
-    - All operations are logged with timestamps and severity levels
-    - Logs are written to Azure Automation output streams for monitoring
+.PARAMETER SubscriptionToTargetZone
+    JSON-serialized dictionary mapping each involved subscription id to the logical availability zone to fault.
+    Example: '{"<subscriptionId>":"<zone>","<subscriptionId2>":"<zone2>"}'.
+    If a subscription's zone value is empty or missing, every resource in that subscription is still faulted but
+    without zone targeting (zone-aware fault routines fall back to acting on the entire resource).
+.PARAMETER TargetZone
+    Optional fallback logical availability zone applied to every resource when SubscriptionToTargetZone is
+    not supplied. Ignored when SubscriptionToTargetZone is provided.
+
 #>
 
 #Requires -Modules Az.Websites, Az.Accounts
@@ -48,11 +34,14 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Comma separated resource IDs of the app services")]
+    [Parameter(Mandatory = $true, HelpMessage = "Comma-separated App Service resource IDs.")]
     [ValidateNotNullOrEmpty()]
     [string]$ResourceIds,
 
-    [Parameter(Mandatory = $true, HelpMessage="Zone on which fault will get induced.")]
+    [Parameter(Mandatory = $false, HelpMessage = "JSON-serialized dictionary mapping each involved subscription id to the logical availability zone to fault (e.g. '{""sub1"":""1"",""sub2"":""2""}'). When supplied, takes precedence over TargetZone. If a subscription's zone value is empty or missing, every resource in that subscription is still faulted but without zone targeting.")]
+    [object]$SubscriptionToTargetZone,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Fallback logical availability zone applied to every resource when SubscriptionToTargetZone is not supplied. Ignored when SubscriptionToTargetZone is provided.")]
     [string]$TargetZone,
 
     [Parameter(Mandatory=$false, HelpMessage="Dummy parameter, this will be ignored")]
@@ -62,6 +51,160 @@ param (
     [Parameter(Mandatory=$false, HelpMessage="Client ID of User-Assigned Managed Identity. If not provided, uses System-Assigned Managed Identity.")]
     [string]$UAMIClientId
 )
+
+function Get-ResourceTargets {
+    <#
+    .SYNOPSIS
+        Pairs each resource id with the target zone resolved from caller input.
+
+    .DESCRIPTION
+        Resolves the target zone for each resource using one of two inputs:
+
+          1. SubscriptionToTargetZone (preferred) - subscription id -> target zone map.
+             Accepted in any of the following shapes:
+               * JSON string of the form '{"<subscriptionId>":"<zone>",...}'.
+               * A Hashtable / IDictionary (e.g. @{ 'sub' = '1' }).
+               * A PSCustomObject deserialised from JSON by the host (this is what
+                 Azure Automation produces when its REST API single-decodes a JSON
+                 parameter value).
+             If a subscription's zone value is empty or missing, the resource is
+             STILL faulted but without zone targeting (the empty zone is propagated
+             downstream and zone-aware fault routines fall back to acting on the
+             entire resource).
+
+          2. TargetZone (fallback) - used only when SubscriptionToTargetZone is
+             null/empty. The same zone string is applied to every resource id.
+
+        Throws if both inputs are empty, the SubscriptionToTargetZone payload is a
+        string that cannot be parsed as JSON, a resource id cannot be parsed, or
+        a resource belongs to a subscription that was not supplied in
+        SubscriptionToTargetZone.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceIds,
+
+        [Parameter(Mandatory = $false)]
+        [object]$SubscriptionToTargetZone,
+
+        [Parameter(Mandatory = $false)]
+        [string]$TargetZone
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ResourceIds)) {
+        throw "ResourceIds parameter is required and cannot be empty."
+    }
+
+    $resourceIdList = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if (-not $resourceIdList -or $resourceIdList.Count -eq 0) {
+        throw "ResourceIds contained no usable entries."
+    }
+
+    # Normalise SubscriptionToTargetZone into a Hashtable<sub,zone> regardless of input shape.
+    $subscriptionZoneMap = $null
+    if ($null -ne $SubscriptionToTargetZone) {
+        if ($SubscriptionToTargetZone -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($SubscriptionToTargetZone)) {
+                try {
+                    $parsedJson = $SubscriptionToTargetZone | ConvertFrom-Json -ErrorAction Stop
+                } catch {
+                    throw "SubscriptionToTargetZone is not valid JSON: $($_.Exception.Message)"
+                }
+                if ($null -eq $parsedJson) {
+                    throw "SubscriptionToTargetZone JSON deserialized to null."
+                }
+                $subscriptionZoneMap = ConvertTo-SubscriptionZoneMap -Source $parsedJson
+            }
+        }
+        elseif ($SubscriptionToTargetZone -is [System.Collections.IDictionary] -or
+                $SubscriptionToTargetZone -is [psobject]) {
+            $subscriptionZoneMap = ConvertTo-SubscriptionZoneMap -Source $SubscriptionToTargetZone
+        }
+        else {
+            throw "SubscriptionToTargetZone has unsupported type '$($SubscriptionToTargetZone.GetType().FullName)'. Expected JSON string, Hashtable, or PSCustomObject."
+        }
+    }
+
+    $parsed = New-Object System.Collections.Generic.List[object]
+
+    if ($null -ne $subscriptionZoneMap -and $subscriptionZoneMap.Count -gt 0) {
+        # Preferred path: per-subscription mapping supplied.
+        foreach ($rid in $resourceIdList) {
+            if ($rid -notmatch '/subscriptions/([^/]+)/') {
+                throw "Invalid resource id '$rid'. Could not extract subscription id."
+            }
+            $sub = $Matches[1]
+            if (-not $subscriptionZoneMap.ContainsKey($sub)) {
+                throw "Resource '$rid' belongs to subscription '$sub' but no entry for that subscription was supplied in SubscriptionToTargetZone."
+            }
+            $parsed.Add([pscustomobject]@{ ResourceId = $rid; TargetZone = $subscriptionZoneMap[$sub] })
+        }
+    }
+    else {
+        # Fallback path: single TargetZone applied to all resources.
+        if ([string]::IsNullOrWhiteSpace($TargetZone)) {
+            throw "Either SubscriptionToTargetZone or TargetZone must be supplied."
+        }
+        $sharedZone = $TargetZone.Trim()
+        foreach ($rid in $resourceIdList) {
+            if ($rid -notmatch '/subscriptions/([^/]+)/') {
+                throw "Invalid resource id '$rid'. Could not extract subscription id."
+            }
+            $parsed.Add([pscustomobject]@{ ResourceId = $rid; TargetZone = $sharedZone })
+        }
+    }
+
+    return ,$parsed.ToArray()
+}
+
+function ConvertTo-SubscriptionZoneMap {
+    <#
+    .SYNOPSIS
+        Normalises a Hashtable / IDictionary / PSCustomObject into a Hashtable<sub,zone>.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Source
+    )
+
+    $map = @{}
+
+    if ($Source -is [System.Collections.IDictionary]) {
+        foreach ($key in $Source.Keys) {
+            $sub = if ($null -eq $key) { '' } else { ([string]$key).Trim() }
+            if ([string]::IsNullOrWhiteSpace($sub)) {
+                throw "SubscriptionToTargetZone contains an empty subscription id key."
+            }
+            if ($map.ContainsKey($sub)) {
+                throw "Duplicate subscription id '$sub' in SubscriptionToTargetZone."
+            }
+            $rawZone = $Source[$key]
+            $zone = if ($null -eq $rawZone) { '' } else { ([string]$rawZone).Trim() }
+            $map[$sub] = $zone
+        }
+    }
+    elseif ($Source -is [psobject]) {
+        foreach ($prop in $Source.PSObject.Properties) {
+            $sub = if ($null -eq $prop.Name) { '' } else { $prop.Name.Trim() }
+            if ([string]::IsNullOrWhiteSpace($sub)) {
+                throw "SubscriptionToTargetZone contains an empty subscription id key."
+            }
+            if ($map.ContainsKey($sub)) {
+                throw "Duplicate subscription id '$sub' in SubscriptionToTargetZone."
+            }
+            $rawZone = $prop.Value
+            $zone = if ($null -eq $rawZone) { '' } else { ([string]$rawZone).Trim() }
+            $map[$sub] = $zone
+        }
+    }
+    else {
+        throw "ConvertTo-SubscriptionZoneMap: unsupported source type '$($Source.GetType().FullName)'."
+    }
+
+    return $map
+}
 
 $functions = {
     #region Functions
@@ -190,16 +333,16 @@ $functions = {
         try {
             if ([string]::IsNullOrEmpty($ClientId)) {
                 Write-Log "Authenticating to Azure using System-Assigned Managed Identity..." "INFO"
-                Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+                Connect-AzAccount -Identity -Verbose:$false -ErrorAction Stop | Out-Null
             } else {
                 Write-Log "Authenticating to Azure using User-Assigned Managed Identity (ClientId: $ClientId)..." "INFO"
-                Connect-AzAccount -Identity -AccountId $ClientId -ErrorAction Stop | Out-Null
+                Connect-AzAccount -Identity -AccountId $ClientId -Verbose:$false -ErrorAction Stop | Out-Null
             }
 
             # If a subscription ID is provided, set the context to that subscription immediately
             if (-not [string]::IsNullOrEmpty($SubscriptionId)) {
                 Write-Log "Setting subscription context to $SubscriptionId" "INFO"
-                Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+                Set-AzContext -SubscriptionId $SubscriptionId -Verbose:$false -ErrorAction Stop | Out-Null
             }
             
             $newContext = Get-AzContext -ErrorAction Stop
@@ -240,13 +383,13 @@ $functions = {
         
         try {
             Write-Log "Checking for required Az.Websites module..." "INFO"
-            if (-not (Get-Module -Name "Az.Websites" -ListAvailable)) {
+            if (-not (Get-Module -Name "Az.Websites" -ListAvailable 4>$null)) {
                 throw "Az.Websites module is not available in this Automation Account"
             }
             
             if (-not (Get-Module -Name "Az.Websites")) {
                 Write-Log "Importing Az.Websites module..." "INFO"
-                Import-Module Az.Websites -ErrorAction Stop -Force
+                Import-Module Az.Websites -Force -ErrorAction Stop 4>$null
             }
             
             Write-Log "Az.Websites module is ready" "SUCCESS"
@@ -476,25 +619,30 @@ $functions = {
 
 # region Main Script Execution
 # Set VerbosePreference to Continue to see Write-Verbose logs in automation job streams.
+# Suppress engine-level module-load verbose noise (PowerShell emits "Loading module"
+# and "Importing cmdlet" while $VerbosePreference is Continue, regardless of -Verbose:$false).
+# Pre-import Az.Accounts silently, then enable verbose so our own Write-Verbose logs appear.
+$VerbosePreference = 'SilentlyContinue'
+Import-Module Az.Accounts -ErrorAction Stop
 $VerbosePreference = 'Continue'
 
 Write-Verbose "============================================================"
 Write-Verbose "AZURE APP SERVICE SIMULATE ZONE FAULT SCRIPT"
 Write-Verbose "============================================================"
 Write-Verbose "Starting Azure app service zonal fault simulation..."
-Write-Verbose "Raw Input: $ResourceIds"
+$loggedSubscriptionToTargetZone = if ($null -eq $SubscriptionToTargetZone) { '<null>' } elseif ($SubscriptionToTargetZone -is [string]) { $SubscriptionToTargetZone } else { $SubscriptionToTargetZone | ConvertTo-Json -Compress -Depth 5 }
+Write-Verbose "Raw Input: ResourceIds=$ResourceIds; SubscriptionToTargetZone=$loggedSubscriptionToTargetZone; TargetZone=$TargetZone"
 
-$appServiceIds = $ResourceIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-if (-not $appServiceIds -or $appServiceIds.Count -eq 0) { throw "No valid app service resource IDs provided" }
-Write-Verbose "Parsed $($appServiceIds.Count) app service id(s)."
+$appServiceTargets = Get-ResourceTargets -ResourceIds $ResourceIds -SubscriptionToTargetZone $SubscriptionToTargetZone -TargetZone $TargetZone
+Write-Verbose "Parsed $($appServiceTargets.Count) app service target(s)."
 
 # Initial connection check in main thread
 try {
     if ($UAMIClientId) {
-        Connect-AzAccount -Identity -AccountId $UAMIClientId -ErrorAction Stop | Out-Null
+        Connect-AzAccount -Identity -AccountId $UAMIClientId -Verbose:$false -ErrorAction Stop | Out-Null
     }
     else {
-        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        Connect-AzAccount -Identity -Verbose:$false -ErrorAction Stop | Out-Null
     }
     $ctx = Get-AzContext -ErrorAction Stop
     Write-Verbose "Initial connection successful as $($ctx.Account.Id) on subscription $($ctx.Subscription.Name)"
@@ -505,21 +653,31 @@ catch {
 
 $scriptStart = Get-Date
 
-Write-Verbose "Starting parallel processing of $($appServiceIds.Count) app services"
+Write-Verbose "Starting parallel processing of $($appServiceTargets.Count) app services"
 
 . $functions
 $functionsScript = $functions.ToString()
 
-# Process app service IDs in parallel - each runspace handles authentication, ASE lookup, and fault injection
-$resultsRaw = $appServiceIds | ForEach-Object -Parallel {
+# Process app service targets in parallel - each runspace handles authentication, ASE lookup, and fault injection
+$resultsRaw = $appServiceTargets | ForEach-Object -Parallel {
     # Set VerbosePreference in the parallel runspace so Write-Verbose logs appear
+    # Suppress engine-level module-load verbose noise (PowerShell emits "Loading module"
+    # and "Importing cmdlet" while $VerbosePreference is Continue, regardless of -Verbose:$false).
+    # Pre-import Az.Accounts silently, then enable verbose so our own Write-Verbose logs appear.
+    $VerbosePreference = 'SilentlyContinue'
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.Websites -ErrorAction Stop
     $VerbosePreference = 'Continue'
     
     # Define functions in the parallel runspace
     $functionBlock = [scriptblock]::Create($using:functionsScript)
     . $functionBlock
     
-    $appServiceResourceId = $_
+    $entry = $_
+    $appServiceResourceId = $entry.ResourceId
+    $targetZone = $entry.TargetZone
+    $targetZoneLabel = if ([string]::IsNullOrWhiteSpace($targetZone)) { '<none - faulting without zone targeting>' } else { $targetZone }
+    Write-Verbose "Targeting zone '$targetZoneLabel' for resource $($entry.ResourceId)"
     $start = Get-Date
     $result = [pscustomobject]@{
         ResourceId = $appServiceResourceId
@@ -529,6 +687,7 @@ $resultsRaw = $appServiceIds | ForEach-Object -Parallel {
         EndTime = $start
         Status = 'FailedToStart'
     }
+
 
     try {
         Write-Log "Processing App Service resource: $appServiceResourceId" "INFO"
@@ -563,7 +722,7 @@ $resultsRaw = $appServiceIds | ForEach-Object -Parallel {
         $aseInfo = ConvertFrom-ResourceId -ResourceId $aseResourceId
         
         # Execute the zonal fault simulation
-        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId -TargetZone $using:TargetZone
+        $faultResult = Invoke-AppServiceZonalFault -ResourceGroupName $aseInfo.ResourceGroup -AppEnvName $aseInfo.AppEnvName -SubscriptionId $aseInfo.SubscriptionId -TargetZone $targetZone
         $end = Get-Date
 
         $result.IsSuccess = $faultResult.IsSuccess
@@ -652,7 +811,7 @@ Write-Output $executionJson
 
 # Fail the runbook if any resource could not be faulted
 if ($failureCount -gt 0) {
-    $errorMsg = "Runbook failed: $failureCount out of $($appServiceIds.Count) AppService(s) could not be faulted. Status: $overallStatus"
+    $errorMsg = "Runbook failed: $failureCount out of $($appServiceTargets.Count) AppService(s) could not be faulted. Status: $overallStatus"
     Write-Error $errorMsg -ErrorAction Stop
     throw $errorMsg
 }
