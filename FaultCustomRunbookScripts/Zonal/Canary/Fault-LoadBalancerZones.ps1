@@ -68,10 +68,12 @@ function Get-ResourceTargets {
           2. TargetZone (fallback) - used only when SubscriptionToTargetZone is
              null/empty. The same zone string is applied to every resource id.
 
-        Throws if both inputs are empty, the SubscriptionToTargetZone payload is a
-        string that cannot be parsed as JSON, a resource id cannot be parsed, or
-        a resource belongs to a subscription that was not supplied in
-        SubscriptionToTargetZone.
+        Allowing both inputs to be empty/null is permitted: an empty target zone is
+        propagated for every resource (downstream zone-aware fault routines treat it as
+        "no zone targeting" / act on the whole resource; zone-agnostic routines ignore it).
+        Throws only if the SubscriptionToTargetZone payload is a string that cannot be
+        parsed as JSON, a resource id cannot be parsed, or a resource belongs to a
+        subscription that was not supplied in SubscriptionToTargetZone.
     #>
     [CmdletBinding()]
     param(
@@ -136,10 +138,10 @@ function Get-ResourceTargets {
     }
     else {
         # Fallback path: single TargetZone applied to all resources.
-        if ([string]::IsNullOrWhiteSpace($TargetZone)) {
-            throw "Either SubscriptionToTargetZone or TargetZone must be supplied."
-        }
-        $sharedZone = $TargetZone.Trim()
+        # Empty/missing TargetZone is allowed (legacy contract) and propagates as an empty zone
+        # string. Downstream zone-aware fault routines treat empty as "no zone targeting" (act on
+        # the whole resource / all zoned backends); zone-agnostic routines ignore it.
+        $sharedZone = if ([string]::IsNullOrWhiteSpace($TargetZone)) { '' } else { $TargetZone.Trim() }
         foreach ($rid in $resourceIdList) {
             if ($rid -notmatch '/subscriptions/([^/]+)/') {
                 throw "Invalid resource id '$rid'. Could not extract subscription id."
