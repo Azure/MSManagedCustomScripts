@@ -75,10 +75,12 @@ function Get-ResourceTargets {
           2. TargetZone (fallback) - used only when SubscriptionToTargetZone is
              null/empty. The same zone string is applied to every resource id.
 
-        Throws if both inputs are empty, the SubscriptionToTargetZone payload is a
-        string that cannot be parsed as JSON, a resource id cannot be parsed, or
-        a resource belongs to a subscription that was not supplied in
-        SubscriptionToTargetZone.
+        Allowing both inputs to be empty/null is permitted: an empty target zone is
+        propagated for every resource (downstream zone-aware fault routines treat it as
+        "no zone targeting" / act on the whole resource; zone-agnostic routines ignore it).
+        Throws only if the SubscriptionToTargetZone payload is a string that cannot be
+        parsed as JSON, a resource id cannot be parsed, or a resource belongs to a
+        subscription that was not supplied in SubscriptionToTargetZone.
     #>
     [CmdletBinding()]
     param(
